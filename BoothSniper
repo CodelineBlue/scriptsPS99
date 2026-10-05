@@ -1,0 +1,1098 @@
+-- ============================================================
+-- PS99 Booth Sniper (Fully UI-Driven)
+-- Everything is configurable in the UI — no script editing needed
+-- Uses BIG Games API + PS99RAP for live values
+-- ============================================================
+
+local httpService = game:GetService("HttpService")
+local players = game:GetService("Players")
+local replicatedStorage = game:GetService("ReplicatedStorage")
+local userInputService = game:GetService("UserInputService")
+local localPlayer = players.LocalPlayer
+
+-- ============================================================
+-- INTERNAL STATE
+-- ============================================================
+local Sniper = {
+    Running = true,
+    RapData = {},
+    RapLastFetch = 0,
+    RapFetchInterval = 300, -- 5 min
+    GameData = { Pets = {}, Booths = {}, Enchants = {}, Misc = {}, Consumables = {} },
+    GameDataLoaded = false,
+    Purchases = {},
+    TotalSpent = 0,
+    PurchaseCount = 0,
+    LastHop = tick(),
+    HopInterval = 180,
+    Debug = false,
+}
+
+local Settings = {
+    MinimumGems = 0,
+    Items = {},
+    Extras = {
+        GargantuanPet = { Enabled = false, Tier = nil, Shiny = nil, MaxPrice = 0, PercentageProfit = 0, BlackList = {} },
+        TitanicPet = { Enabled = false, Tier = nil, Shiny = nil, MaxPrice = 0, PercentageProfit = 0, BlackList = {} },
+        HugePet = { Enabled = false, Tier = nil, Shiny = nil, MaxPrice = 0, PercentageProfit = 0, BlackList = {} },
+        ExclusivePet = { Enabled = false, Tier = nil, Shiny = nil, MaxPrice = 0, PercentageProfit = 0, BlackList = {} },
+        AnyItem = { Enabled = false, Tier = nil, Shiny = nil, MaxPrice = 0, PercentageProfit = 0, BlackList = {} },
+    },
+    CustomExtras = {},
+    ServerHop = { Enabled = false, Type = "Both" },
+    Webhook = { Enabled = false, URL = "" },
+}
+
+-- ============================================================
+-- HTTP + API
+-- ============================================================
+local API_BASE = "https://ps99.biggamesapi.io/api"
+local RAP_BASE = "https://ps99rap.com/api"
+
+local function httpGet(url)
+    local req = (syn and syn.request) or (http and http.request) or http_request or request
+    if req then
+        local ok, res = pcall(function() return req({ Url = url, Method = "GET" }) end)
+        if ok and res and res.Body then return res.Body end
+    end
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    return ok and body or nil
+end
+
+local function httpPost(url, payload)
+    local req = (syn and syn.request) or (http and http.request) or http_request or request
+    if req then
+        pcall(function()
+            req({
+                Url = url, Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = httpService:JSONEncode(payload),
+            })
+        end)
+    end
+end
+
+-- ============================================================
+-- LOAD GAME DATA (collections)
+-- ============================================================
+local function loadGameData()
+    if Sniper.GameDataLoaded then return end
+
+    local collections = {
+        { api = "Pets", target = "Pets" },
+        { api = "Booths", target = "Booths" },
+        { api = "Enchants", target = "Enchants" },
+        { api = "MiscItems", target = "Misc" },
+        { api = "Consumables", target = "Consumables" },
+    }
+
+    for _, c in ipairs(collections) do
+        local body = httpGet(API_BASE .. "/collection/" .. c.api)
+        if body then
+            local ok, data = pcall(function() return httpService:JSONDecode(body) end)
+            if ok and data and data.data then
+                for _, entry in ipairs(data.data) do
+                    local name = entry.configName or (entry.configData and entry.configData.name)
+                    if name then
+                        Sniper.GameData[c.target][name] = entry
+                    end
+                end
+            end
+        end
+    end
+
+    Sniper.GameDataLoaded = true
+end
+
+-- ============================================================
+-- RAP
+-- ============================================================
+local function fetchRap()
+    if tick() - Sniper.RapLastFetch < Sniper.RapFetchInterval and next(Sniper.RapData) then
+        return
+    end
+    local body = httpGet(RAP_BASE .. "/items")
+    if not body then return end
+    local ok, data = pcall(function() return httpService:JSONDecode(body) end)
+    if ok and data then
+        Sniper.RapData = data
+        Sniper.RapLastFetch = tick()
+    end
+end
+
+local function getRap(itemName, category)
+    fetchRap()
+    if Sniper.RapData[itemName] then
+        return tonumber(Sniper.RapData[itemName].rap) or 0
+    end
+    local lower = string.lower(itemName)
+    for id, entry in pairs(Sniper.RapData) do
+        local n = entry.name or entry.id or tostring(id)
+        if string.lower(n) == lower then
+            return tonumber(entry.rap) or 0
+        end
+    end
+    return 0
+end
+
+-- ============================================================
+-- BOOTH SCANNING
+-- ============================================================
+local function parsePrice(str)
+    if not str then return 0 end
+    local num = str:match("([%d%.]+)")
+    if not num then return 0 end
+    local n = tonumber(num)
+    if not n then return 0 end
+    local suffix = str:match("[KMBTkmbt]")
+    if suffix then
+        suffix = string.upper(suffix)
+        if suffix == "K" then return n * 1e3
+        elseif suffix == "M" then return n * 1e6
+        elseif suffix == "B" then return n * 1e9
+        elseif suffix == "T" then return n * 1e12 end
+    end
+    return n
+end
+
+local function scanBooths()
+    local items = {}
+    local plaza = workspace:FindFirstChild("TradingPlaza")
+        or workspace:FindFirstChild("Plaza")
+        or workspace:FindFirstChild("Trading")
+    if not plaza then return items end
+
+    for _, obj in ipairs(plaza:GetDescendants()) do
+        if obj:IsA("Model") and (obj.Name:lower():find("booth") or obj.Name:lower():find("shop")) then
+            local owner = obj:GetAttribute("Owner") or obj:GetAttribute("Player") or "Unknown"
+            for _, child in ipairs(obj:GetDescendants()) do
+                if child:IsA("TextLabel") and child.Text ~= "" then
+                    local text = child.Text
+                    local name, price = text:match("(.+)%-%s*([%d%.]+[KMBTkmbt]?)")
+                    if name and price then
+                        local cleanName = name:gsub("^%s*(.-)%s*$", "%1")
+                        local p = parsePrice(price)
+                        if p > 0 then
+                            table.insert(items, {
+                                owner = owner,
+                                itemName = cleanName,
+                                price = p,
+                                booth = obj,
+                            })
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return items
+end
+
+-- ============================================================
+-- REMOTE DETECTION (dynamic — finds the booth purchase remote)
+-- ============================================================
+local function findBoothRemote()
+    local network = replicatedStorage:FindFirstChild("Network")
+    if not network then return nil end
+
+    -- known/likely remote names (updated with PS99 conventions)
+    local candidates = {
+        "Booths_RequestPurchase",
+        "Booths_Purchase",
+        "Booths_Buy",
+        "TradingBooth_Purchase",
+        "Booth_RequestPurchase",
+        "Booths_RequestBuy",
+        "TradeBooths_Purchase",
+        "PlazaBooths_Purchase",
+        "BoothsMachine_RequestPurchase",
+    }
+
+    for _, name in ipairs(candidates) do
+        local remote = network:FindFirstChild(name)
+        if remote then return remote end
+    end
+
+    -- dynamic fallback: scan for any remote with "booth" in the name
+    for _, child in ipairs(network:GetChildren()) do
+        if child.Name:lower():find("booth") and child:IsA("RemoteFunction") then
+            return child
+        end
+    end
+
+    return nil
+end
+
+local function purchaseItem(item)
+    local remote = findBoothRemote()
+    if not remote then return false end
+    local ok = pcall(function()
+        remote:InvokeServer(item.owner, item.itemName, item.price)
+    end)
+    return ok
+end
+
+-- ============================================================
+-- MATCHING
+-- ============================================================
+local function matchesRule(itemName, itemPrice, rule, category)
+    if rule.BlackList then
+        for _, blocked in ipairs(rule.BlackList) do
+            if itemName == blocked then return false end
+        end
+    end
+
+    local rap = getRap(itemName, category)
+    if rap <= 0 then return false end
+
+    local pct = tonumber(rule.PercentageProfit) or 0
+    local maxPrice = rap * (1 - pct / 100)
+
+    if rule.MaxPrice and rule.MaxPrice > 0 then
+        maxPrice = math.min(maxPrice, rule.MaxPrice)
+    end
+
+    return itemPrice <= maxPrice
+end
+
+local function shouldBuy(item)
+    for _, rule in ipairs(Settings.Items) do
+        if rule.Item == item.itemName then
+            if matchesRule(item.itemName, item.price, rule, rule.Class) then
+                return true
+            end
+        end
+    end
+
+    for cat, rule in pairs(Settings.Extras) do
+        if rule.Enabled then
+            local catName = cat:gsub("Pet$", "")
+            local itemData = Sniper.GameData.Pets[item.itemName]
+            local matches = false
+            if cat == "AnyItem" then
+                matches = true
+            elseif itemData and itemData.category == catName then
+                matches = true
+            end
+            if matches and matchesRule(item.itemName, item.price, rule, "Pets") then
+                return true
+            end
+        end
+    end
+
+    for cat, rules in pairs(Settings.CustomExtras) do
+        for _, rule in ipairs(rules) do
+            if rule.Enabled and matchesRule(item.itemName, item.price, rule, cat) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+-- ============================================================
+-- NOTIFY
+-- ============================================================
+local function notify(item)
+    local msg = string.format("**Booth Snipe!**\nItem: %s\nPrice: %s\nOwner: %s",
+        item.itemName, tostring(item.price), tostring(item.owner))
+
+    if Settings.Webhook.Enabled and Settings.Webhook.URL ~= "" then
+        httpPost(Settings.Webhook.URL, { content = msg, username = "Booth Sniper" })
+    end
+
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "Booth Snipe!",
+            Text = item.itemName .. " for " .. tostring(item.price),
+            Duration = 5,
+        })
+    end)
+
+    table.insert(Sniper.Purchases, { name = item.itemName, price = item.price, time = os.time() })
+    Sniper.PurchaseCount = Sniper.PurchaseCount + 1
+    Sniper.TotalSpent = Sniper.TotalSpent + item.price
+end
+
+-- ============================================================
+-- SERVER HOP
+-- ============================================================
+local function serverHop()
+    if not Settings.ServerHop.Enabled then return end
+    local body = httpGet(string.format(
+        "https://games.roblox.com/v1/games/%d/servers/Public?limit=100", game.PlaceId))
+    if not body then return end
+    local ok, data = pcall(function() return httpService:JSONDecode(body) end)
+    if not ok or not data or not data.data then return end
+    for _, s in ipairs(data.data) do
+        if s.id ~= game.JobId and s.playing < s.maxPlayers then
+            pcall(function()
+                game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, s.id, localPlayer)
+            end)
+            return
+        end
+    end
+end
+
+-- ============================================================
+-- MAIN LOOP
+-- ============================================================
+task.spawn(function()
+    loadGameData()
+    fetchRap()
+
+    while Sniper.Running do
+        task.wait(0.5)
+
+        local gems = 0
+        pcall(function()
+            local lib = require(replicatedStorage.Library.Client.Save)
+            local save = lib.Get()
+            if save and save.Inventory and save.Inventory.Currency then
+                gems = save.Inventory.Currency.Diamonds or 0
+            end
+        end)
+
+        if gems < Settings.MinimumGems then
+            task.wait(2)
+            continue
+        end
+
+        local items = scanBooths()
+        for _, item in ipairs(items) do
+            if Sniper.Running and gems >= item.price then
+                if shouldBuy(item) then
+                    if purchaseItem(item) then
+                        notify(item)
+                    end
+                end
+            end
+        end
+
+        if Settings.ServerHop.Enabled and tick() - Sniper.LastHop > Sniper.HopInterval then
+            Sniper.LastHop = tick()
+            serverHop()
+        end
+    end
+end)
+
+-- ============================================================
+-- ============================================================
+--                    FULL UI
+-- ============================================================
+-- ============================================================
+
+local COL_BG     = Color3.fromRGB(18, 18, 22)
+local COL_PANEL  = Color3.fromRGB(24, 24, 30)
+local COL_HEADER = Color3.fromRGB(14, 14, 18)
+local COL_ACCENT = Color3.fromRGB(0, 150, 255)
+local COL_GREEN  = Color3.fromRGB(0, 180, 80)
+local COL_RED    = Color3.fromRGB(200, 50, 50)
+local COL_TEXT   = Color3.fromRGB(235, 235, 235)
+local COL_MUTED  = Color3.fromRGB(150, 150, 160)
+local COL_ROW    = Color3.fromRGB(32, 32, 40)
+local COL_INPUT  = Color3.fromRGB(14, 14, 18)
+
+local playerGui = game:GetService("CoreGui")
+if type(gethui) == "function" then
+    pcall(function() playerGui = gethui() end)
+end
+
+if playerGui:FindFirstChild("PS99_BoothSniper") then
+    playerGui.PS99_BoothSniper:Destroy()
+end
+
+local gui = Instance.new("ScreenGui", playerGui)
+gui.Name = "PS99_BoothSniper"
+gui.ResetOnSpawn = false
+
+-- ============================================================
+-- Helpers
+-- ============================================================
+local function newCorner(parent, r)
+    local c = Instance.new("UICorner", parent); c.CornerRadius = UDim.new(0, r or 6); return c
+end
+local function newStroke(parent, color, t)
+    local s = Instance.new("UIStroke", parent); s.Color = color or COL_ACCENT; s.Thickness = t or 1; return s
+end
+local function makeDraggable(frame, handle)
+    handle = handle or frame
+    local dragging, dragInput, dragStart, startPos
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true; dragStart = input.Position; startPos = frame.Position
+        end
+    end)
+    handle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+    userInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local d = input.Position - dragStart
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+    userInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+end
+
+-- ============================================================
+-- UI Components
+-- ============================================================
+local function createToggle(parent, text, initial, callback)
+    local row = Instance.new("Frame", parent)
+    row.Size = UDim2.new(1, -10, 0, 28)
+    row.BackgroundColor3 = COL_ROW; row.BorderSizePixel = 0
+    newCorner(row, 5)
+
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size = UDim2.new(1, -60, 1, 0); lbl.Position = UDim2.new(0, 10, 0, 0)
+    lbl.BackgroundTransparency = 1; lbl.Text = text
+    lbl.TextColor3 = COL_TEXT; lbl.Font = Enum.Font.GothamSemibold
+    lbl.TextSize = 11; lbl.TextXAlignment = Enum.TextXAlignment.Left
+
+    local sw = Instance.new("TextButton", row)
+    sw.Size = UDim2.new(0, 40, 0, 18); sw.Position = UDim2.new(1, -48, 0.5, -9)
+    sw.BackgroundColor3 = initial and COL_GREEN or Color3.fromRGB(60, 60, 70)
+    sw.Text = ""; sw.BorderSizePixel = 0; newCorner(sw, 9)
+
+    local knob = Instance.new("Frame", sw)
+    knob.Size = UDim2.new(0, 14, 0, 14)
+    knob.Position = initial and UDim2.new(1, -16, 0.5, -7) or UDim2.new(0, 2, 0.5, -7)
+    knob.BackgroundColor3 = Color3.new(1, 1, 1); knob.BorderSizePixel = 0; newCorner(knob, 7)
+
+    local state = initial
+    sw.MouseButton1Click:Connect(function()
+        state = not state
+        sw.BackgroundColor3 = state and COL_GREEN or Color3.fromRGB(60, 60, 70)
+        knob.Position = state and UDim2.new(1, -16, 0.5, -7) or UDim2.new(0, 2, 0.5, -7)
+        if callback then callback(state) end
+    end)
+
+    return { frame = row, set = function(v)
+        state = v
+        sw.BackgroundColor3 = v and COL_GREEN or Color3.fromRGB(60, 60, 70)
+        knob.Position = v and UDim2.new(1, -16, 0.5, -7) or UDim2.new(0, 2, 0.5, -7)
+        if callback then callback(v) end
+    end, get = function() return state end }
+end
+
+local function createDropdown(parent, label, options, initial, callback)
+    local wrap = Instance.new("Frame", parent)
+    wrap.Size = UDim2.new(1, -10, 0, 28); wrap.BackgroundColor3 = COL_ROW
+    wrap.BorderSizePixel = 0; newCorner(wrap, 5)
+
+    local lbl = Instance.new("TextLabel", wrap)
+    lbl.Size = UDim2.new(0.45, 0, 1, 0); lbl.Position = UDim2.new(0, 10, 0, 0)
+    lbl.BackgroundTransparency = 1; lbl.Text = label
+    lbl.TextColor3 = COL_TEXT; lbl.Font = Enum.Font.GothamSemibold
+    lbl.TextSize = 11; lbl.TextXAlignment = Enum.TextXAlignment.Left
+
+    local btn = Instance.new("TextButton", wrap)
+    btn.Size = UDim2.new(0.5, -10, 0, 20); btn.Position = UDim2.new(0.5, 0, 0.5, -10)
+    btn.BackgroundColor3 = COL_INPUT; btn.Text = tostring(initial)
+    btn.TextColor3 = COL_ACCENT; btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 10; btn.BorderSizePixel = 0; newCorner(btn, 4)
+
+    local list = Instance.new("Frame", wrap)
+    list.Size = UDim2.new(0.5, -10, 0, #options * 22)
+    list.Position = UDim2.new(0.5, 0, 1, 2)
+    list.BackgroundColor3 = COL_PANEL; list.BorderSizePixel = 0
+    list.Visible = false; list.ZIndex = 10; newCorner(list, 4)
+    newStroke(list, COL_ACCENT, 1)
+
+    local layout = Instance.new("UIListLayout", list)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    local current = initial
+    for i, opt in ipairs(options) do
+        local oBtn = Instance.new("TextButton", list)
+        oBtn.Size = UDim2.new(1, 0, 0, 22); oBtn.BackgroundTransparency = 1
+        oBtn.Text = tostring(opt); oBtn.TextColor3 = COL_TEXT
+        oBtn.Font = Enum.Font.GothamSemibold; oBtn.TextSize = 10
+        oBtn.LayoutOrder = i; oBtn.ZIndex = 11
+        oBtn.MouseEnter:Connect(function() oBtn.BackgroundTransparency = 0.85; oBtn.BackgroundColor3 = COL_ACCENT end)
+        oBtn.MouseLeave:Connect(function() oBtn.BackgroundTransparency = 1 end)
+        oBtn.MouseButton1Click:Connect(function()
+            current = opt; btn.Text = tostring(opt); list.Visible = false
+            if callback then callback(opt) end
+        end)
+    end
+    btn.MouseButton1Click:Connect(function() list.Visible = not list.Visible end)
+    return { frame = wrap, get = function() return current end }
+end
+
+local function createInput(parent, label, initial, callback)
+    local row = Instance.new("Frame", parent)
+    row.Size = UDim2.new(1, -10, 0, 28); row.BackgroundColor3 = COL_ROW
+    row.BorderSizePixel = 0; newCorner(row, 5)
+
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size = UDim2.new(0.5, 0, 1, 0); lbl.Position = UDim2.new(0, 10, 0, 0)
+    lbl.BackgroundTransparency = 1; lbl.Text = label
+    lbl.TextColor3 = COL_TEXT; lbl.Font = Enum.Font.GothamSemibold
+    lbl.TextSize = 11; lbl.TextXAlignment = Enum.TextXAlignment.Left
+
+    local box = Instance.new("TextBox", row)
+    box.Size = UDim2.new(0.45, -10, 0, 20); box.Position = UDim2.new(0.5, 0, 0.5, -10)
+    box.BackgroundColor3 = COL_INPUT; box.Text = tostring(initial)
+    box.TextColor3 = COL_ACCENT; box.Font = Enum.Font.GothamBold
+    box.TextSize = 10; box.BorderSizePixel = 0; box.ClearTextOnFocus = false; newCorner(box, 4)
+    box.FocusLost:Connect(function() if callback then callback(box.Text) end end)
+    return { frame = row, get = function() return box.Text end, set = function(v) box.Text = tostring(v) end }
+end
+
+-- ============================================================
+-- Main Window
+-- ============================================================
+local main = Instance.new("Frame", gui)
+main.Size = UDim2.new(0, 580, 0, 420)
+main.Position = UDim2.new(0.5, -290, 0.5, -210)
+main.BackgroundColor3 = COL_BG; main.BorderSizePixel = 0
+newCorner(main, 10); newStroke(main, COL_ACCENT, 1.5); makeDraggable(main)
+
+local header = Instance.new("Frame", main)
+header.Size = UDim2.new(1, 0, 0, 32); header.BackgroundColor3 = COL_HEADER
+header.BorderSizePixel = 0; newCorner(header, 10)
+local hFill = Instance.new("Frame", header)
+hFill.Size = UDim2.new(1, 0, 0, 12); hFill.Position = UDim2.new(0, 0, 1, -12)
+hFill.BackgroundColor3 = COL_HEADER; hFill.BorderSizePixel = 0
+
+local hTitle = Instance.new("TextLabel", header)
+hTitle.Size = UDim2.new(1, -140, 1, 0); hTitle.Position = UDim2.new(0, 12, 0, 0)
+hTitle.BackgroundTransparency = 1; hTitle.Text = "PS99 Booth Sniper"
+hTitle.TextColor3 = COL_ACCENT; hTitle.Font = Enum.Font.GothamBold
+hTitle.TextSize = 13; hTitle.TextXAlignment = Enum.TextXAlignment.Left
+
+local runBtn = Instance.new("TextButton", header)
+runBtn.Size = UDim2.new(0, 60, 0, 22); runBtn.Position = UDim2.new(1, -100, 0.5, -11)
+runBtn.BackgroundColor3 = COL_GREEN; runBtn.Text = "RUNNING"
+runBtn.TextColor3 = Color3.new(1, 1, 1); runBtn.Font = Enum.Font.GothamBold
+runBtn.TextSize = 10; runBtn.BorderSizePixel = 0; newCorner(runBtn, 4)
+
+local minBtn = Instance.new("TextButton", header)
+minBtn.Size = UDim2.new(0, 24, 0, 22); minBtn.Position = UDim2.new(1, -32, 0.5, -11)
+minBtn.BackgroundColor3 = COL_RED; minBtn.Text = "—"
+minBtn.TextColor3 = Color3.new(1, 1, 1); minBtn.Font = Enum.Font.GothamBold
+minBtn.TextSize = 12; minBtn.BorderSizePixel = 0; newCorner(minBtn, 4)
+
+-- Sidebar
+local sidebar = Instance.new("Frame", main)
+sidebar.Size = UDim2.new(0, 130, 1, -32); sidebar.Position = UDim2.new(0, 0, 0, 32)
+sidebar.BackgroundColor3 = COL_PANEL; sidebar.BorderSizePixel = 0
+
+local sidebarLayout = Instance.new("UIListLayout", sidebar)
+sidebarLayout.Padding = UDim.new(0, 4)
+sidebarLayout.SortOrder = Enum.SortOrder.LayoutOrder
+sidebarLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+local content = Instance.new("Frame", main)
+content.Size = UDim2.new(1, -131, 1, -32); content.Position = UDim2.new(0, 131, 0, 32)
+content.BackgroundTransparency = 1
+
+local pages = {}
+local tabButtons = {}
+local currentTab = nil
+
+local function createPage(name)
+    local sf = Instance.new("ScrollingFrame", content)
+    sf.Size = UDim2.new(1, 0, 1, 0); sf.BackgroundTransparency = 1
+    sf.BorderSizePixel = 0; sf.ScrollBarThickness = 3
+    sf.ScrollBarImageColor3 = COL_ACCENT; sf.Visible = false
+    local l = Instance.new("UIListLayout", sf)
+    l.Padding = UDim.new(0, 5); l.SortOrder = Enum.SortOrder.LayoutOrder
+    l.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    l:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        sf.CanvasSize = UDim2.new(0, 0, 0, l.AbsoluteContentSize.Y + 10)
+    end)
+    pages[name] = { frame = sf, layout = l }
+    return sf
+end
+
+for _, t in ipairs({ "Items", "Extras", "Config", "History" }) do
+    createPage(t)
+end
+
+local function selectTab(name)
+    for n, p in pairs(pages) do p.frame.Visible = (n == name) end
+    for n, b in pairs(tabButtons) do
+        b.BackgroundColor3 = (n == name) and COL_ACCENT or COL_ROW
+    end
+    currentTab = name
+end
+
+for _, tabName in ipairs({ "Items", "Extras", "Config", "History" }) do
+    local btn = Instance.new("TextButton", sidebar)
+    btn.Size = UDim2.new(1, -10, 0, 30); btn.BackgroundColor3 = COL_ROW
+    btn.Text = tabName; btn.TextColor3 = COL_TEXT
+    btn.Font = Enum.Font.GothamBold; btn.TextSize = 11
+    btn.BorderSizePixel = 0; newCorner(btn, 5)
+    tabButtons[tabName] = btn
+    btn.MouseButton1Click:Connect(function() selectTab(tabName) end)
+end
+selectTab("Items")
+
+-- ============================================================
+-- ITEMS PAGE (with item picker from API)
+-- ============================================================
+local itemsPage = pages["Items"].frame
+local itemsContainer = Instance.new("Frame", itemsPage)
+itemsContainer.Size = UDim2.new(1, -10, 0, 0)
+itemsContainer.AutomaticSize = Enum.AutomaticSize.Y
+itemsContainer.BackgroundTransparency = 1
+itemsContainer.LayoutOrder = 1
+local itemsLayout = Instance.new("UIListLayout", itemsContainer)
+itemsLayout.Padding = UDim.new(0, 5)
+itemsLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+local function refreshItems()
+    for _, c in ipairs(itemsContainer:GetChildren()) do
+        if c:IsA("Frame") then c:Destroy() end
+    end
+    for i, e in ipairs(Settings.Items) do
+        local row = Instance.new("Frame", itemsContainer)
+        row.Size = UDim2.new(1, 0, 0, 30); row.BackgroundColor3 = COL_ROW
+        row.BorderSizePixel = 0; newCorner(row, 5)
+
+        local txt = Instance.new("TextLabel", row)
+        txt.Size = UDim2.new(1, -80, 1, 0); txt.Position = UDim2.new(0, 8, 0, 0)
+        txt.BackgroundTransparency = 1
+        txt.Text = string.format("%s | %s | Max:%d | %%:%d",
+            e.Class, e.Item, tonumber(e.MaxPrice) or 0, tonumber(e.PercentageProfit) or 0)
+        txt.TextColor3 = COL_TEXT; txt.Font = Enum.Font.GothamSemibold
+        txt.TextSize = 10; txt.TextXAlignment = Enum.TextXAlignment.Left
+
+        local edit = Instance.new("TextButton", row)
+        edit.Size = UDim2.new(0, 30, 0, 20); edit.Position = UDim2.new(1, -68, 0.5, -10)
+        edit.BackgroundColor3 = COL_ACCENT; edit.Text = "✎"
+        edit.TextColor3 = Color3.new(1, 1, 1); edit.Font = Enum.Font.GothamBold
+        edit.TextSize = 11; edit.BorderSizePixel = 0; newCorner(edit, 4)
+        edit.MouseButton1Click:Connect(function()
+            -- open edit modal pre-filled
+            table.remove(Settings.Items, i)
+            refreshItems()
+            openItemModal(e)
+        end)
+
+        local del = Instance.new("TextButton", row)
+        del.Size = UDim2.new(0, 26, 0, 20); del.Position = UDim2.new(1, -34, 0.5, -10)
+        del.BackgroundColor3 = COL_RED; del.Text = "X"
+        del.TextColor3 = Color3.new(1, 1, 1); del.Font = Enum.Font.GothamBold
+        del.TextSize = 11; del.BorderSizePixel = 0; newCorner(del, 4)
+        del.MouseButton1Click:Connect(function()
+            table.remove(Settings.Items, i)
+            refreshItems()
+        end)
+    end
+end
+
+-- Item modal (shared for add + edit)
+local modal = Instance.new("Frame", main)
+modal.Size = UDim2.new(0, 360, 0, 320)
+modal.Position = UDim2.new(0.5, -180, 0.5, -160)
+modal.BackgroundColor3 = COL_PANEL; modal.BorderSizePixel = 0
+modal.Visible = false; modal.ZIndex = 20; newCorner(modal, 8)
+newStroke(modal, COL_ACCENT, 1.5)
+
+local mTitle = Instance.new("TextLabel", modal)
+mTitle.Size = UDim2.new(1, -20, 0, 26); mTitle.Position = UDim2.new(0, 10, 0, 6)
+mTitle.BackgroundTransparency = 1; mTitle.Text = "Add Item to Snipe"
+mTitle.TextColor3 = COL_ACCENT; mTitle.Font = Enum.Font.GothamBold
+mTitle.TextSize = 12; mTitle.TextXAlignment = Enum.TextXAlignment.Left
+
+local mBody = Instance.new("Frame", modal)
+mBody.Size = UDim2.new(1, -20, 0, 250); mBody.Position = UDim2.new(0, 10, 0, 34)
+mBody.BackgroundTransparency = 1
+local mLayout = Instance.new("UIListLayout", mBody)
+mLayout.Padding = UDim.new(0, 5); mLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+local mClass = createDropdown(mBody, "Class", {
+    "Pet", "Misc", "Consumable", "Enchant", "Charm", "Potion",
+    "Ultimate", "Hoverboard", "Lootbox", "Box", "Seed", "Egg", "Fruit", "Booth", "Card"
+}, "Pet", function(v) end)
+
+-- Item picker: dropdown populated from API data for the selected class
+local itemNames = {}
+local mItemPick = createDropdown(mBody, "Item", { "Loading..." }, "Loading...", function(v) end)
+
+-- refresh item list when class changes
+mClass.frame:FindFirstChild("TextButton") -- (dropdown uses internal button; simpler to hook via callback)
+-- We rebuild the item dropdown options by recreating it. For simplicity, use a text input
+-- plus a "search API" button.
+
+-- Replace item dropdown with a smart input + suggestions
+local mItemInput = createInput(mBody, "Item Name", "", function(v) end)
+
+-- Search button that populates a dropdown of matches
+local searchRow = Instance.new("Frame", mBody)
+searchRow.Size = UDim2.new(1, -10, 0, 28); searchRow.BackgroundColor3 = COL_ROW
+searchRow.BorderSizePixel = 0; newCorner(searchRow, 5)
+
+local searchBtn = Instance.new("TextButton", searchRow)
+searchBtn.Size = UDim2.new(1, -20, 1, -4); searchBtn.Position = UDim2.new(0, 10, 0, 2)
+searchBtn.BackgroundColor3 = COL_ACCENT; searchBtn.Text = "🔍 SEARCH API FOR ITEMS"
+searchBtn.TextColor3 = Color3.new(1, 1, 1); searchBtn.Font = Enum.Font.GothamBold
+searchBtn.TextSize = 10; searchBtn.BorderSizePixel = 0; newCorner(searchBtn, 4)
+
+local mTier = createInput(mBody, "Tier (nil/0/1/2)", "nil", function(v) end)
+local mShiny = createDropdown(mBody, "Shiny", { "nil", "true", "false" }, "nil", function(v) end)
+local mMaxPrice = createInput(mBody, "Max Price", "0", function(v) end)
+local mPct = createInput(mBody, "Percentage Profit", "0", function(v) end)
+
+-- Search results list (appears below search button)
+local searchResults = Instance.new("Frame", modal)
+searchResults.Size = UDim2.new(1, -20, 0, 120)
+searchResults.Position = UDim2.new(0, 10, 0, 270)
+searchResults.BackgroundColor3 = COL_BG; searchResults.BorderSizePixel = 0
+searchResults.Visible = false; searchResults.ZIndex = 25; newCorner(searchResults, 6)
+newStroke(searchResults, COL_ACCENT, 1)
+
+local srList = Instance.new("ScrollingFrame", searchResults)
+srList.Size = UDim2.new(1, -10, 1, -10); srList.Position = UDim2.new(0, 5, 0, 5)
+srList.BackgroundTransparency = 1; srList.ScrollBarThickness = 3
+srList.ScrollBarImageColor3 = COL_ACCENT
+
+local srLayout = Instance.new("UIListLayout", srList)
+srLayout.Padding = UDim.new(0, 2); srLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local function runSearch()
+    local query = string.lower(mItemInput.get())
+    local class = mClass.get()
+    local target = Sniper.GameData[class] or Sniper.GameData[class .. "s"] or {}
+
+    for _, c in ipairs(srList:GetChildren()) do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+
+    local count = 0
+    for name, _ in pairs(target) do
+        if string.find(string.lower(name), query, 1, true) then
+            local btn = Instance.new("TextButton", srList)
+            btn.Size = UDim2.new(1, -5, 0, 22); btn.BackgroundColor3 = COL_ROW
+            btn.Text = name; btn.TextColor3 = COL_TEXT
+            btn.Font = Enum.Font.GothamSemibold; btn.TextSize = 10
+            btn.BorderSizePixel = 0; newCorner(btn, 3)
+            btn.LayoutOrder = count
+            btn.MouseButton1Click:Connect(function()
+                mItemInput.set(name)
+                searchResults.Visible = false
+            end)
+            count = count + 1
+        end
+        if count >= 50 then break end
+    end
+
+    srList.CanvasSize = UDim2.new(0, 0, 0, srLayout.AbsoluteContentSize.Y + 10)
+    searchResults.Visible = count > 0
+end
+
+searchBtn.MouseButton1Click:Connect(runSearch)
+
+local function parseTier(v)
+    if v == "nil" or v == "" then return nil end
+    return tonumber(v) or nil
+end
+local function parseShiny(v)
+    if v == "true" then return true end
+    if v == "false" then return false end
+    return nil
+end
+
+local confirm = Instance.new("TextButton", modal)
+confirm.Size = UDim2.new(0, 120, 0, 26); confirm.Position = UDim2.new(0.5, -125, 1, -34)
+confirm.BackgroundColor3 = COL_GREEN; confirm.Text = "ADD"
+confirm.TextColor3 = Color3.new(1, 1, 1); confirm.Font = Enum.Font.GothamBold
+confirm.TextSize = 11; confirm.BorderSizePixel = 0; newCorner(confirm, 4)
+
+local cancel = Instance.new("TextButton", modal)
+cancel.Size = UDim2.new(0, 120, 0, 26); cancel.Position = UDim2.new(0.5, 5, 1, -34)
+cancel.BackgroundColor3 = COL_ROW; cancel.Text = "CANCEL"
+cancel.TextColor3 = COL_TEXT; cancel.Font = Enum.Font.GothamBold
+cancel.TextSize = 11; cancel.BorderSizePixel = 0; newCorner(cancel, 4)
+
+confirm.MouseButton1Click:Connect(function()
+    if mItemInput.get() == "" then return end
+    table.insert(Settings.Items, {
+        Class = mClass.get(),
+        Item = mItemInput.get(),
+        Tier = parseTier(mTier.get()),
+        Shiny = parseShiny(mShiny.get()),
+        MaxPrice = tonumber(mMaxPrice.get()) or 0,
+        PercentageProfit = tonumber(mPct.get()) or 0,
+    })
+    modal.Visible = false
+    searchResults.Visible = false
+    refreshItems()
+end)
+cancel.MouseButton1Click:Connect(function() modal.Visible = false; searchResults.Visible = false end)
+
+-- openItemModal for editing
+function openItemModal(existing)
+    mTitle.Text = existing and "Edit Item" or "Add Item to Snipe"
+    if existing then
+        mItemInput.set(existing.Item or "")
+        mTier.set(tostring(existing.Tier or "nil"))
+        mMaxPrice.set(tostring(existing.MaxPrice or 0))
+        mPct.set(tostring(existing.PercentageProfit or 0))
+    else
+        mItemInput.set(""); mTier.set("nil"); mMaxPrice.set("0"); mPct.set("0")
+    end
+    modal.Visible = true
+end
+
+-- Add item button
+local addItemBtn = Instance.new("TextButton", itemsPage)
+addItemBtn.Size = UDim2.new(1, -10, 0, 28); addItemBtn.BackgroundColor3 = COL_ACCENT
+addItemBtn.Text = "+ ADD ITEM"; addItemBtn.TextColor3 = Color3.new(1, 1, 1)
+addItemBtn.Font = Enum.Font.GothamBold; addItemBtn.TextSize = 11
+addItemBtn.BorderSizePixel = 0; addItemBtn.LayoutOrder = 2; newCorner(addItemBtn, 5)
+addItemBtn.MouseButton1Click:Connect(function() openItemModal(nil) end)
+
+refreshItems()
+
+-- ============================================================
+-- EXTRAS PAGE
+-- ============================================================
+local extrasPage = pages["Extras"].frame
+local extrasLayout = Instance.new("UIListLayout", extrasPage)
+extrasLayout.Padding = UDim.new(0, 6)
+extrasLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+local extraCats = {
+    { key = "GargantuanPet", label = "Gargantuan Pets" },
+    { key = "TitanicPet",    label = "Titanic Pets" },
+    { key = "HugePet",       label = "Huge Pets" },
+    { key = "ExclusivePet",  label = "Exclusive Pets" },
+    { key = "AnyItem",       label = "Any Item" },
+}
+
+for _, c in ipairs(extraCats) do
+    local cfg = Settings.Extras[c.key]
+
+    local sec = Instance.new("Frame", extrasPage)
+    sec.Size = UDim2.new(1, -10, 0, 110); sec.BackgroundColor3 = COL_PANEL
+    sec.BorderSizePixel = 0; sec.LayoutOrder = #extrasPage:GetChildren(); newCorner(sec, 6)
+
+    local t = Instance.new("TextLabel", sec)
+    t.Size = UDim2.new(1, -20, 0, 20); t.Position = UDim2.new(0, 10, 0, 4)
+    t.BackgroundTransparency = 1; t.Text = c.label
+    t.TextColor3 = COL_ACCENT; t.Font = Enum.Font.GothamBold
+    t.TextSize = 11; t.TextXAlignment = Enum.TextXAlignment.Left
+
+    local body = Instance.new("Frame", sec)
+    body.Size = UDim2.new(1, -20, 0, 80); body.Position = UDim2.new(0, 10, 0, 26)
+    body.BackgroundTransparency = 1
+    local bl = Instance.new("UIListLayout", body)
+    bl.Padding = UDim.new(0, 4); bl.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+    createToggle(body, "Enabled", cfg.Enabled, function(v) cfg.Enabled = v end)
+    createInput(body, "Max Price", tostring(cfg.MaxPrice), function(v) cfg.MaxPrice = tonumber(v) or 0 end)
+    createInput(body, "Percentage Profit", tostring(cfg.PercentageProfit), function(v) cfg.PercentageProfit = tonumber(v) or 0 end)
+end
+
+-- CustomExtras section
+local customSec = Instance.new("Frame", extrasPage)
+customSec.Size = UDim2.new(1, -10, 0, 130); customSec.BackgroundColor3 = COL_PANEL
+customSec.BorderSizePixel = 0; customSec.LayoutOrder = 100; newCorner(customSec, 6)
+
+local ct = Instance.new("TextLabel", customSec)
+ct.Size = UDim2.new(1, -20, 0, 20); ct.Position = UDim2.new(0, 10, 0, 4)
+ct.BackgroundTransparency = 1; ct.Text = "Custom Extras"
+ct.TextColor3 = COL_ACCENT; ct.Font = Enum.Font.GothamBold
+ct.TextSize = 11; ct.TextXAlignment = Enum.TextXAlignment.Left
+
+local customClassDD = createDropdown(customSec, "Class", {
+    "Pet", "Misc", "Consumable", "Enchant", "Charm", "Potion",
+    "Ultimate", "Hoverboard", "Lootbox", "Box", "Seed", "Egg", "Fruit", "Booth", "Card"
+}, "Pet", function(v) end)
+customClassDD.frame.Position = UDim2.new(0, 10, 0, 28)
+customClassDD.frame.Size = UDim2.new(1, -20, 0, 28)
+
+local customToggle = createToggle(customSec, "Enabled", false, function(v)
+    local cls = customClassDD.get()
+    if not Settings.CustomExtras[cls] then
+        Settings.CustomExtras[cls] = { { Enabled = false, Tier = nil, Shiny = nil, MaxPrice = 0, PercentageProfit = 0, BlackList = {} } }
+    end
+    Settings.CustomExtras[cls][1].Enabled = v
+end)
+customToggle.frame.Position = UDim2.new(0, 10, 0, 60)
+customToggle.frame.Size = UDim2.new(1, -20, 0, 28)
+
+local customMax = createInput(customSec, "Max Price", "0", function(v)
+    local cls = customClassDD.get()
+    if not Settings.CustomExtras[cls] then
+        Settings.CustomExtras[cls] = { { Enabled = false, Tier = nil, Shiny = nil, MaxPrice = 0, PercentageProfit = 0, BlackList = {} } }
+    end
+    Settings.CustomExtras[cls][1].MaxPrice = tonumber(v) or 0
+end)
+customMax.frame.Position = UDim2.new(0, 10, 0, 92)
+customMax.frame.Size = UDim2.new(1, -20, 0, 28)
+
+-- ============================================================
+-- CONFIG PAGE
+-- ============================================================
+local configPage = pages["Config"].frame
+local configLayout = Instance.new("UIListLayout", configPage)
+configLayout.Padding = UDim.new(0, 6)
+configLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+-- General
+local genSec = Instance.new("Frame", configPage)
+genSec.Size = UDim2.new(1, -10, 0, 80); genSec.BackgroundColor3 = COL_PANEL
+genSec.BorderSizePixel = 0; genSec.LayoutOrder = 1; newCorner(genSec, 6)
+
+local gt = Instance.new("TextLabel", genSec)
+gt.Size = UDim2.new(1, -20, 0, 20); gt.Position = UDim2.new(0, 10, 0, 4)
+gt.BackgroundTransparency = 1; gt.Text = "General"
+gt.TextColor3 = COL_ACCENT; gt.Font = Enum.Font.GothamBold
+gt.TextSize = 11; gt.TextXAlignment = Enum.TextXAlignment.Left
+
+local genBody = Instance.new("Frame", genSec)
+genBody.Size = UDim2.new(1, -20, 0, 50); genBody.Position = UDim2.new(0, 10, 0, 26)
+genBody.BackgroundTransparency = 1
+local gl = Instance.new("UIListLayout", genBody)
+gl.Padding = UDim.new(0, 4); gl.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+createInput(genBody, "Minimum Gems", tostring(Settings.MinimumGems), function(v)
+    Settings.MinimumGems = tonumber(v) or 0
+end)
+
+-- ServerHop
+local hopSec = Instance.new("Frame", configPage)
+hopSec.Size = UDim2.new(1, -10, 0, 130); hopSec.BackgroundColor3 = COL_PANEL
+hopSec.BorderSizePixel = 0; hopSec.LayoutOrder = 2; newCorner(hopSec, 6)
+
+local ht = Instance.new("TextLabel", hopSec)
+ht.Size = UDim2.new(1, -20, 0, 20); ht.Position = UDim2.new(0, 10, 0, 4)
+ht.BackgroundTransparency = 1; ht.Text = "Server Hop"
+ht.TextColor3 = COL_ACCENT; ht.Font = Enum.Font.GothamBold
+ht.TextSize = 11; ht.TextXAlignment = Enum.TextXAlignment.Left
+
+local hopBody = Instance.new("Frame", hopSec)
+hopBody.Size = UDim2.new(1, -20, 0, 100); hopBody.Position = UDim2.new(0, 10, 0, 26)
+hopBody.BackgroundTransparency = 1
+local hl = Instance.new("UIListLayout", hopBody)
+hl.Padding = UDim.new(0, 4); hl.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+createToggle(hopBody, "Enabled", Settings.ServerHop.Enabled, function(v) Settings.ServerHop.Enabled = v end)
+createDropdown(hopBody, "Hop Type", { "Both", "Normal", "Pro" }, Settings.ServerHop.Type, function(v) Settings.ServerHop.Type = v end)
+createInput(hopBody, "Hop Interval (s)", tostring(Sniper.HopInterval), function(v) Sniper.HopInterval = tonumber(v) or 180 end)
+
+-- Webhook
+local whSec = Instance.new("Frame", configPage)
+whSec.Size = UDim2.new(1, -10, 0, 110); whSec.BackgroundColor3 = COL_PANEL
+whSec.BorderSizePixel = 0; whSec.LayoutOrder = 3; newCorner(whSec, 6)
+
+local wt = Instance.new("TextLabel", whSec)
+wt.Size = UDim2.new(1, -20, 0, 20); wt.Position = UDim2.new(0, 10, 0, 4)
+wt.BackgroundTransparency = 1; wt.Text = "Webhook"
+wt.TextColor3 = COL_ACCENT; wt.Font = Enum.Font.GothamBold
+wt.TextSize = 11; wt.TextXAlignment = Enum.TextXAlignment.Left
+
+local whBody = Instance.new("Frame", whSec)
+whBody.Size = UDim2.new(1, -20, 0, 80); whBody.Position = UDim2.new(0, 10, 0, 26)
+whBody.BackgroundTransparency = 1
+local wl = Instance.new("UIListLayout", whBody)
+wl.Padding = UDim.new(0, 4); wl.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+createToggle(whBody, "Enabled", Settings.Webhook.Enabled, function(v) Settings.Webhook.Enabled = v end)
+createInput(whBody, "Webhook URL", Settings.Webhook.URL, function(v) Settings.Webhook.URL = v end)
+
+-- Debug
+local dbgSec = Instance.new("Frame", configPage)
+dbgSec.Size = UDim2.new(1, -10, 0, 80); dbgSec.BackgroundColor3 = COL_PANEL
+dbgSec.BorderSizePixel = 0; dbgSec.LayoutOrder = 4; newCorner(dbgSec, 6)
+
+local dt = Instance.new("TextLabel", dbgSec)
+dt.Size = UDim2.new(1, -20, 0, 20); dt.Position = UDim2.new(0, 10, 0, 4)
+dt.BackgroundTransparency = 1; dt.Text = "Debug"
+dt.TextColor3 = COL_ACCENT; dt.Font = Enum.Font.GothamBold
+dt.TextSize = 11; dt.TextXAlignment = Enum.TextXAlignment.Left
+
+local dbgBody = Instance.new("Frame", dbgSec)
+dbgBody.Size = UDim2.new(1, -20, 0, 50); dbgBody.Position = UDim2.new(0, 10, 0, 26)
+dbgBody.BackgroundTransparency = 1
+local dl = Instance.new("UIListLayout", dbgBody)
+dl.Padding = UDim.new(0, 4); dl.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+createToggle(dbgBody, "Console Logging", Sniper.Debug, function(v) Sniper.Debug = v end)
+
+-- ============================================================
+-- HISTORY PAGE
+-- ============================================================
+local histPage = pages["History"].frame
+local histLayout = Instance.new("UIListLayout", histPage)
+histLayout.Padding = UDim.new(0, 4)
+histLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+local histHeader = Instance.new("Frame", histPage)
+histHeader.Size = UDim2.new(1, -10, 0, 40); histHeader.BackgroundColor3 = COL_PANEL
+histHeader.BorderSizePixel = 0; histHeader.LayoutOrder = 1; newCorner(histHeader, 6)
+
+local histStats = Instance.new("TextLabel", histHeader)
+histStats.Size = UDim2.new(1, -20, 1, 0); histStats.Position = UDim2.new(0, 10, 0, 0)
+histStats.BackgroundTransparency = 1; histStats.Text = "Purchases: 0 | Total Spent: 0"
+histStats.TextColor3 = COL_ACCENT; histStats.Font = Enum.Font.GothamBold
+histStats.TextSize = 11; histStats.TextXAlignment = Enum.TextXAlignment.Left
+
+local histContainer = Instance.new("Frame", histPage)
+histContainer.Size = UDim2.new(1, -10, 0, 0)
+histContainer.AutomaticSize = Enum.AutomaticSize.Y
+histContainer.BackgroundTransparency = 1; histContainer.LayoutOrder = 2
+local hcl = Instance.new("UIListLayout", histContainer)
+hcl.Padding = UDim.new(0, 3); hcl.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+-- history updater
+task.spawn(function()
+    while gui.Parent do
+        task.wait(1)
+        histStats.Text = string.format("Purchases: %d | Total Spent: %s",
+            Sniper.PurchaseCount, tostring(Sniper.TotalSpent))
+
+        for _, c in ipairs(histContainer:GetChildren()) do
+            if c:IsA("Frame") then c:Destroy() end
+        end
+
+        local start = math.max(1, #Sniper.Purchases - 49)
+        for i = start, #Sniper.Purchases do
+            local p = Sniper.Purchases[i]
+            local row = Instance.new("Frame", histContainer)
+            row.Size = UDim2.new(1, 0, 0, 24); row.BackgroundColor3 = COL_ROW
+            row.BorderSizePixel = 0; newCorner(row, 4)
+            local t = Instance.new("TextLabel", row)
+            t.Size = UDim2.new(1, -10, 1, 0); t.Position = UDim2.new(0, 8, 0, 0)
+            t.BackgroundTransparency = 1
+            t.Text = string.format("%s — %s (%s)", p.name, tostring(p.price), os.date("%H:%M:%S", p.time))
+            t.TextColor3 = COL_TEXT; t.Font = Enum.Font.GothamSemibold
+            t.TextSize = 10; t.TextXAlignment = Enum.TextXAlignment.Left
+        end
+    end
+end)
+
+-- ============================================================
+-- Minimize + Run
+-- ============================================================
+local mini = Instance.new("TextButton", gui)
+mini.Size = UDim2.new(0, 44, 0, 44); mini.Position = UDim2.new(0.5, -22, 0, 20)
+mini.BackgroundColor3 = COL_PANEL; mini.Text = "🐾"; mini.TextSize = 20
+mini.Visible = false; mini.BorderSizePixel = 0; newCorner(mini, 22)
+newStroke(mini, COL_ACCENT, 1.5); makeDraggable(mini)
+
+local function setMin(v) main.Visible = not v; mini.Visible = v end
+minBtn.MouseButton1Click:Connect(function() setMin(true) end)
+mini.MouseButton1Click:Connect(function() setMin(false) end)
+
+runBtn.MouseButton1Click:Connect(function()
+    Sniper.Running = not Sniper.Running
+    if Sniper.Running then
+        runBtn.BackgroundColor3 = COL_GREEN; runBtn.Text = "RUNNING"
+    else
+        runBtn.BackgroundColor3 = COL_RED; runBtn.Text = "STOPPED"
+    end
+end)
