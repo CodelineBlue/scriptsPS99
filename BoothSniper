@@ -697,7 +697,7 @@ local modal = Instance.new("Frame", main)
 modal.Size = UDim2.new(0, 360, 0, 320)
 modal.Position = UDim2.new(0.5, -180, 0.5, -160)
 modal.BackgroundColor3 = COL_PANEL; modal.BorderSizePixel = 0
-modal.Visible = false; modal.ZIndex = 20; newCorner(modal, 8)
+modal.Visible = false; newCorner(modal, 8)
 newStroke(modal, COL_ACCENT, 1.5)
 
 local mTitle = Instance.new("TextLabel", modal)
