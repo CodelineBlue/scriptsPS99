@@ -750,7 +750,7 @@ local searchResults = Instance.new("Frame", modal)
 searchResults.Size = UDim2.new(1, -20, 0, 120)
 searchResults.Position = UDim2.new(0, 10, 0, 270)
 searchResults.BackgroundColor3 = COL_BG; searchResults.BorderSizePixel = 0
-searchResults.Visible = false; searchResults.ZIndex = 25; newCorner(searchResults, 6)
+searchResults.Visible = false; searchResults.ZIndex = 2; newCorner(searchResults, 6)
 newStroke(searchResults, COL_ACCENT, 1)
 
 local srList = Instance.new("ScrollingFrame", searchResults)
