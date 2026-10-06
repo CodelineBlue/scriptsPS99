@@ -157,6 +157,7 @@ end
 
 local function scanBooths()
     local items = {}
+    local seen = {}
     local plaza = workspace:FindFirstChild("TradingPlaza")
         or workspace:FindFirstChild("Plaza")
         or workspace:FindFirstChild("Trading")
@@ -173,12 +174,16 @@ local function scanBooths()
                         local cleanName = name:gsub("^%s*(.-)%s*$", "%1")
                         local p = parsePrice(price)
                         if p > 0 then
-                            table.insert(items, {
-                                owner = owner,
-                                itemName = cleanName,
-                                price = p,
-                                booth = obj,
-                            })
+                            local key = string.lower(string.format("%s|%s|%s", tostring(owner), cleanName, tostring(p)))
+                            if not seen[key] then
+                                seen[key] = true
+                                table.insert(items, {
+                                    owner = owner,
+                                    itemName = cleanName,
+                                    price = p,
+                                    booth = obj,
+                                })
+                            end
                         end
                     end
                 end
@@ -215,7 +220,7 @@ local function findBoothRemote()
 
     -- dynamic fallback: scan for any remote with "booth" in the name
     for _, child in ipairs(network:GetChildren()) do
-        if child.Name:lower():find("booth") and child:IsA("RemoteFunction") then
+        if child.Name:lower():find("booth") and (child:IsA("RemoteFunction") or child:IsA("RemoteEvent")) then
             return child
         end
     end
@@ -227,7 +232,11 @@ local function purchaseItem(item)
     local remote = findBoothRemote()
     if not remote then return false end
     local ok = pcall(function()
-        remote:InvokeServer(item.owner, item.itemName, item.price)
+        if remote:IsA("RemoteFunction") then
+            remote:InvokeServer(item.owner, item.itemName, item.price)
+        elseif remote:IsA("RemoteEvent") then
+            remote:FireServer(item.owner, item.itemName, item.price)
+        end
     end)
     return ok
 end
@@ -525,7 +534,15 @@ local function createDropdown(parent, label, options, initial, callback)
         end)
     end
     btn.MouseButton1Click:Connect(function() list.Visible = not list.Visible end)
-    return { frame = wrap, get = function() return current end }
+    return {
+        frame = wrap,
+        get = function() return current end,
+        set = function(v)
+            current = v
+            btn.Text = tostring(v)
+            list.Visible = false
+        end,
+    }
 end
 
 local function createInput(parent, label, initial, callback)
@@ -674,10 +691,7 @@ local function refreshItems()
         edit.TextColor3 = Color3.new(1, 1, 1); edit.Font = Enum.Font.GothamBold
         edit.TextSize = 11; edit.BorderSizePixel = 0; newCorner(edit, 4)
         edit.MouseButton1Click:Connect(function()
-            -- open edit modal pre-filled
-            table.remove(Settings.Items, i)
-            refreshItems()
-            openItemModal(e)
+            openItemModal(e, i)
         end)
 
         local del = Instance.new("TextButton", row)
@@ -804,6 +818,8 @@ local function parseShiny(v)
     return nil
 end
 
+local editIndex = nil
+
 local confirm = Instance.new("TextButton", modal)
 confirm.Size = UDim2.new(0, 120, 0, 26); confirm.Position = UDim2.new(0.5, -125, 1, -34)
 confirm.BackgroundColor3 = COL_GREEN; confirm.Text = "ADD"
@@ -818,31 +834,45 @@ cancel.TextSize = 11; cancel.BorderSizePixel = 0; newCorner(cancel, 4)
 
 confirm.MouseButton1Click:Connect(function()
     if mItemInput.get() == "" then return end
-    table.insert(Settings.Items, {
+
+    local entry = {
         Class = mClass.get(),
         Item = mItemInput.get(),
         Tier = parseTier(mTier.get()),
         Shiny = parseShiny(mShiny.get()),
         MaxPrice = tonumber(mMaxPrice.get()) or 0,
         PercentageProfit = tonumber(mPct.get()) or 0,
-    })
+    }
+
+    if editIndex then
+        Settings.Items[editIndex] = entry
+    else
+        table.insert(Settings.Items, entry)
+    end
+
+    editIndex = nil
     modal.Visible = false
     searchResults.Visible = false
     refreshItems()
 end)
-cancel.MouseButton1Click:Connect(function() modal.Visible = false; searchResults.Visible = false end)
+cancel.MouseButton1Click:Connect(function()
+    editIndex = nil
+    modal.Visible = false; searchResults.Visible = false
+end)
 
 -- openItemModal for editing
-function openItemModal(existing)
+function openItemModal(existing, index)
+    editIndex = index
     mTitle.Text = existing and "Edit Item" or "Add Item to Snipe"
-    if existing then
-        mItemInput.set(existing.Item or "")
-        mTier.set(tostring(existing.Tier or "nil"))
-        mMaxPrice.set(tostring(existing.MaxPrice or 0))
-        mPct.set(tostring(existing.PercentageProfit or 0))
-    else
-        mItemInput.set(""); mTier.set("nil"); mMaxPrice.set("0"); mPct.set("0")
-    end
+    local class = existing and (existing.Class or "Pet") or "Pet"
+    local shiny = existing and (existing.Shiny == true and "true" or existing.Shiny == false and "false" or "nil") or "nil"
+
+    mClass.set(class)
+    mShiny.set(shiny)
+    mItemInput.set(existing and (existing.Item or "") or "")
+    mTier.set(tostring(existing and existing.Tier or "nil"))
+    mMaxPrice.set(tostring(existing and existing.MaxPrice or 0))
+    mPct.set(tostring(existing and existing.PercentageProfit or 0))
     modal.Visible = true
 end
 
