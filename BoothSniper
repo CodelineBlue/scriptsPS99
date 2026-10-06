@@ -20,9 +20,15 @@ local Sniper = {
     RapFetchInterval = 300, -- 5 min
     GameData = { Pets = {}, Booths = {}, Enchants = {}, Misc = {}, Consumables = {} },
     GameDataLoaded = false,
+    GameDataLoading = false,
+    GameDataLastAttempt = 0,
+    GameDataRetryInterval = 60,
+    GameDataCollectionsLoaded = {},
     Purchases = {},
     TotalSpent = 0,
     PurchaseCount = 0,
+    RecentRequests = {},
+    LastRequestCleanup = 0,
     LastHop = tick(),
     HopInterval = 180,
     Debug = false,
@@ -39,7 +45,7 @@ local Settings = {
         AnyItem = { Enabled = false, Tier = nil, Shiny = nil, MaxPrice = 0, PercentageProfit = 0, BlackList = {} },
     },
     CustomExtras = {},
-    ServerHop = { Enabled = false, Type = "Both" },
+    ServerHop = { Enabled = false },
     Webhook = { Enabled = false, URL = "" },
 }
 
@@ -76,7 +82,12 @@ end
 -- LOAD GAME DATA (collections)
 -- ============================================================
 local function loadGameData()
-    if Sniper.GameDataLoaded then return end
+    if Sniper.GameDataLoaded or Sniper.GameDataLoading
+        or tick() - Sniper.GameDataLastAttempt < Sniper.GameDataRetryInterval then
+        return
+    end
+    Sniper.GameDataLoading = true
+    Sniper.GameDataLastAttempt = tick()
 
     local collections = {
         { api = "Pets", target = "Pets" },
@@ -87,21 +98,34 @@ local function loadGameData()
     }
 
     for _, c in ipairs(collections) do
-        local body = httpGet(API_BASE .. "/collection/" .. c.api)
-        if body then
-            local ok, data = pcall(function() return httpService:JSONDecode(body) end)
-            if ok and data and data.data then
-                for _, entry in ipairs(data.data) do
-                    local name = entry.configName or (entry.configData and entry.configData.name)
-                    if name then
-                        Sniper.GameData[c.target][name] = entry
+        if not Sniper.GameDataCollectionsLoaded[c.target] then
+            local body = httpGet(API_BASE .. "/collection/" .. c.api)
+            if body then
+                local ok, data = pcall(function() return httpService:JSONDecode(body) end)
+                if ok and data and type(data.data) == "table" then
+                    for _, entry in ipairs(data.data) do
+                        if type(entry) == "table" then
+                            local configData = type(entry.configData) == "table" and entry.configData or nil
+                            local name = entry.configName or (configData and configData.name)
+                            if type(name) == "string" then
+                                Sniper.GameData[c.target][name] = entry
+                            end
+                        end
                     end
+                    Sniper.GameDataCollectionsLoaded[c.target] = true
                 end
             end
         end
     end
 
     Sniper.GameDataLoaded = true
+    for _, c in ipairs(collections) do
+        if not Sniper.GameDataCollectionsLoaded[c.target] then
+            Sniper.GameDataLoaded = false
+            break
+        end
+    end
+    Sniper.GameDataLoading = false
 end
 
 -- ============================================================
@@ -215,7 +239,9 @@ local function findBoothRemote()
 
     for _, name in ipairs(candidates) do
         local remote = network:FindFirstChild(name)
-        if remote then return remote end
+        if remote and (remote:IsA("RemoteFunction") or remote:IsA("RemoteEvent")) then
+            return remote
+        end
     end
 
     -- dynamic fallback: scan for any remote with "booth" in the name
@@ -230,15 +256,18 @@ end
 
 local function purchaseItem(item)
     local remote = findBoothRemote()
-    if not remote then return false end
-    local ok = pcall(function()
+    if not remote then return nil end
+    local ok, result = pcall(function()
         if remote:IsA("RemoteFunction") then
-            remote:InvokeServer(item.owner, item.itemName, item.price)
+            return remote:InvokeServer(item.owner, item.itemName, item.price)
         elseif remote:IsA("RemoteEvent") then
             remote:FireServer(item.owner, item.itemName, item.price)
+            return "sent"
         end
     end)
-    return ok
+    if not ok or result == false then return nil end
+    if result == true then return "confirmed" end
+    return "sent"
 end
 
 -- ============================================================
@@ -249,6 +278,24 @@ local function matchesRule(itemName, itemPrice, rule, category)
         for _, blocked in ipairs(rule.BlackList) do
             if itemName == blocked then return false end
         end
+    end
+
+    if rule.Tier ~= nil or rule.Shiny ~= nil then
+        local collection = category
+        if collection == "Pet" then collection = "Pets" end
+        if collection == "Misc" then collection = "Misc" end
+        if collection == "Consumable" then collection = "Consumables" end
+        if collection == "Enchant" then collection = "Enchants" end
+        local entry = Sniper.GameData[collection] and Sniper.GameData[collection][itemName]
+        local configData = entry and type(entry.configData) == "table" and entry.configData or {}
+        local tier = entry and (entry.tier or entry.Tier) or configData.tier or configData.Tier
+        local shiny = entry and entry.shiny
+        if shiny == nil then shiny = entry and entry.Shiny end
+        if shiny == nil then shiny = configData.shiny end
+        if shiny == nil then shiny = configData.Shiny end
+
+        if rule.Tier ~= nil and tonumber(tier) ~= tonumber(rule.Tier) then return false end
+        if rule.Shiny ~= nil and shiny ~= rule.Shiny then return false end
     end
 
     local rap = getRap(itemName, category)
@@ -303,9 +350,10 @@ end
 -- ============================================================
 -- NOTIFY
 -- ============================================================
-local function notify(item)
-    local msg = string.format("**Booth Snipe!**\nItem: %s\nPrice: %s\nOwner: %s",
-        item.itemName, tostring(item.price), tostring(item.owner))
+local function notify(item, confirmed)
+    local status = confirmed and "Purchase confirmed" or "Purchase request sent (not confirmed)"
+    local msg = string.format("**%s**\nItem: %s\nPrice: %s\nOwner: %s",
+        status, item.itemName, tostring(item.price), tostring(item.owner))
 
     if Settings.Webhook.Enabled and Settings.Webhook.URL ~= "" then
         httpPost(Settings.Webhook.URL, { content = msg, username = "Booth Sniper" })
@@ -313,15 +361,22 @@ local function notify(item)
 
     pcall(function()
         game:GetService("StarterGui"):SetCore("SendNotification", {
-            Title = "Booth Snipe!",
+            Title = status,
             Text = item.itemName .. " for " .. tostring(item.price),
             Duration = 5,
         })
     end)
 
-    table.insert(Sniper.Purchases, { name = item.itemName, price = item.price, time = os.time() })
-    Sniper.PurchaseCount = Sniper.PurchaseCount + 1
-    Sniper.TotalSpent = Sniper.TotalSpent + item.price
+    table.insert(Sniper.Purchases, {
+        name = item.itemName,
+        price = item.price,
+        time = os.time(),
+        confirmed = confirmed,
+    })
+    if confirmed then
+        Sniper.PurchaseCount = Sniper.PurchaseCount + 1
+        Sniper.TotalSpent = Sniper.TotalSpent + item.price
+    end
 end
 
 -- ============================================================
@@ -351,37 +406,60 @@ task.spawn(function()
     loadGameData()
     fetchRap()
 
-    while Sniper.Running do
+    while true do
         task.wait(0.5)
+        if not Sniper.Running then
+            continue
+        end
+        if not Sniper.GameDataLoaded then
+            loadGameData()
+        end
 
-        local gems = 0
+        local gems = nil
         pcall(function()
             local lib = require(replicatedStorage.Library.Client.Save)
             local save = lib.Get()
             if save and save.Inventory and save.Inventory.Currency then
-                gems = save.Inventory.Currency.Diamonds or 0
+                gems = tonumber(save.Inventory.Currency.Diamonds)
             end
         end)
 
-        if gems < Settings.MinimumGems then
+        if Settings.ServerHop.Enabled and tick() - Sniper.LastHop > Sniper.HopInterval then
+            Sniper.LastHop = tick()
+            serverHop()
+        end
+
+        if not gems or gems < Settings.MinimumGems then
             task.wait(2)
             continue
         end
 
         local items = scanBooths()
+        if tick() - Sniper.LastRequestCleanup >= 30 then
+            for key, requestedAt in pairs(Sniper.RecentRequests) do
+                if tick() - requestedAt >= 15 then
+                    Sniper.RecentRequests[key] = nil
+                end
+            end
+            Sniper.LastRequestCleanup = tick()
+        end
         for _, item in ipairs(items) do
+            local requestKey = string.lower(string.format("%s|%s|%s",
+                tostring(item.owner), item.itemName, tostring(item.price)))
+            local lastRequest = Sniper.RecentRequests[requestKey]
+            if lastRequest and tick() - lastRequest < 15 then
+                continue
+            end
             if Sniper.Running and gems >= item.price then
                 if shouldBuy(item) then
-                    if purchaseItem(item) then
-                        notify(item)
+                    local outcome = purchaseItem(item)
+                    if outcome then
+                        Sniper.RecentRequests[requestKey] = tick()
+                        gems = gems - item.price
+                        notify(item, outcome == "confirmed")
                     end
                 end
             end
-        end
-
-        if Settings.ServerHop.Enabled and tick() - Sniper.LastHop > Sniper.HopInterval then
-            Sniper.LastHop = tick()
-            serverHop()
         end
     end
 end)
@@ -786,6 +864,9 @@ local function runSearch()
         Booth = "Booths",
     }
     local target = Sniper.GameData[collectionByClass[class] or class] or {}
+    if not Sniper.GameDataLoaded then
+        task.spawn(loadGameData)
+    end
 
     for _, c in ipairs(srList:GetChildren()) do
         if c:IsA("TextButton") or c:IsA("TextLabel") then c:Destroy() end
@@ -814,9 +895,13 @@ local function runSearch()
         local empty = Instance.new("TextLabel", srList)
         empty.Size = UDim2.new(1, -5, 0, 22)
         empty.BackgroundTransparency = 1
-        empty.Text = Sniper.GameDataLoaded
-            and "No matching items found"
-            or "Item data is still loading; search again shortly"
+        if not collectionByClass[class] and not Sniper.GameData[class] then
+            empty.Text = "No API collection is configured for this class"
+        elseif Sniper.GameDataLoaded then
+            empty.Text = "No matching items found"
+        else
+            empty.Text = "Item data is loading or unavailable; try again shortly"
+        end
         empty.TextColor3 = COL_MUTED
         empty.Font = Enum.Font.GothamSemibold
         empty.TextSize = 10
@@ -948,7 +1033,7 @@ end
 
 -- CustomExtras section
 local customSec = Instance.new("Frame", extrasPage)
-customSec.Size = UDim2.new(1, -10, 0, 130); customSec.BackgroundColor3 = COL_PANEL
+customSec.Size = UDim2.new(1, -10, 0, 162); customSec.BackgroundColor3 = COL_PANEL
 customSec.BorderSizePixel = 0; customSec.LayoutOrder = 100; newCorner(customSec, 6)
 
 local ct = Instance.new("TextLabel", customSec)
@@ -957,32 +1042,48 @@ ct.BackgroundTransparency = 1; ct.Text = "Custom Extras"
 ct.TextColor3 = COL_ACCENT; ct.Font = Enum.Font.GothamBold
 ct.TextSize = 11; ct.TextXAlignment = Enum.TextXAlignment.Left
 
+local customToggle, customMax, customPct
+local function getCustomRule(class)
+    if not Settings.CustomExtras[class] then
+        Settings.CustomExtras[class] = {
+            { Enabled = false, Tier = nil, Shiny = nil, MaxPrice = 0, PercentageProfit = 0, BlackList = {} }
+        }
+    end
+    return Settings.CustomExtras[class][1]
+end
+
 local customClassDD = createDropdown(customSec, "Class", {
     "Pet", "Misc", "Consumable", "Enchant", "Charm", "Potion",
     "Ultimate", "Hoverboard", "Lootbox", "Box", "Seed", "Egg", "Fruit", "Booth", "Card"
-}, "Pet", function(v) end)
+}, "Pet", function(class)
+    local rule = getCustomRule(class)
+    customToggle.set(rule.Enabled)
+    customMax.set(rule.MaxPrice)
+    customPct.set(rule.PercentageProfit)
+end)
 customClassDD.frame.Position = UDim2.new(0, 10, 0, 28)
 customClassDD.frame.Size = UDim2.new(1, -20, 0, 28)
 
-local customToggle = createToggle(customSec, "Enabled", false, function(v)
+customToggle = createToggle(customSec, "Enabled", false, function(v)
     local cls = customClassDD.get()
-    if not Settings.CustomExtras[cls] then
-        Settings.CustomExtras[cls] = { { Enabled = false, Tier = nil, Shiny = nil, MaxPrice = 0, PercentageProfit = 0, BlackList = {} } }
-    end
-    Settings.CustomExtras[cls][1].Enabled = v
+    getCustomRule(cls).Enabled = v
 end)
 customToggle.frame.Position = UDim2.new(0, 10, 0, 60)
 customToggle.frame.Size = UDim2.new(1, -20, 0, 28)
 
-local customMax = createInput(customSec, "Max Price", "0", function(v)
+customMax = createInput(customSec, "Max Price", "0", function(v)
     local cls = customClassDD.get()
-    if not Settings.CustomExtras[cls] then
-        Settings.CustomExtras[cls] = { { Enabled = false, Tier = nil, Shiny = nil, MaxPrice = 0, PercentageProfit = 0, BlackList = {} } }
-    end
-    Settings.CustomExtras[cls][1].MaxPrice = tonumber(v) or 0
+    getCustomRule(cls).MaxPrice = tonumber(v) or 0
 end)
 customMax.frame.Position = UDim2.new(0, 10, 0, 92)
 customMax.frame.Size = UDim2.new(1, -20, 0, 28)
+
+customPct = createInput(customSec, "Percentage Profit", "0", function(v)
+    local cls = customClassDD.get()
+    getCustomRule(cls).PercentageProfit = tonumber(v) or 0
+end)
+customPct.frame.Position = UDim2.new(0, 10, 0, 124)
+customPct.frame.Size = UDim2.new(1, -20, 0, 28)
 
 -- ============================================================
 -- CONFIG PAGE
@@ -1015,7 +1116,7 @@ end)
 
 -- ServerHop
 local hopSec = Instance.new("Frame", configPage)
-hopSec.Size = UDim2.new(1, -10, 0, 130); hopSec.BackgroundColor3 = COL_PANEL
+hopSec.Size = UDim2.new(1, -10, 0, 100); hopSec.BackgroundColor3 = COL_PANEL
 hopSec.BorderSizePixel = 0; hopSec.LayoutOrder = 2; newCorner(hopSec, 6)
 
 local ht = Instance.new("TextLabel", hopSec)
@@ -1025,14 +1126,18 @@ ht.TextColor3 = COL_ACCENT; ht.Font = Enum.Font.GothamBold
 ht.TextSize = 11; ht.TextXAlignment = Enum.TextXAlignment.Left
 
 local hopBody = Instance.new("Frame", hopSec)
-hopBody.Size = UDim2.new(1, -20, 0, 100); hopBody.Position = UDim2.new(0, 10, 0, 26)
+hopBody.Size = UDim2.new(1, -20, 0, 68); hopBody.Position = UDim2.new(0, 10, 0, 26)
 hopBody.BackgroundTransparency = 1
 local hl = Instance.new("UIListLayout", hopBody)
 hl.Padding = UDim.new(0, 4); hl.HorizontalAlignment = Enum.HorizontalAlignment.Center
 
 createToggle(hopBody, "Enabled", Settings.ServerHop.Enabled, function(v) Settings.ServerHop.Enabled = v end)
-createDropdown(hopBody, "Hop Type", { "Both", "Normal", "Pro" }, Settings.ServerHop.Type, function(v) Settings.ServerHop.Type = v end)
-createInput(hopBody, "Hop Interval (s)", tostring(Sniper.HopInterval), function(v) Sniper.HopInterval = tonumber(v) or 180 end)
+createInput(hopBody, "Hop Interval (s)", tostring(Sniper.HopInterval), function(v)
+    local interval = tonumber(v)
+    if interval and interval >= 30 then
+        Sniper.HopInterval = interval
+    end
+end)
 
 -- Webhook
 local whSec = Instance.new("Frame", configPage)
@@ -1102,7 +1207,7 @@ hcl.Padding = UDim.new(0, 3); hcl.HorizontalAlignment = Enum.HorizontalAlignment
 task.spawn(function()
     while gui.Parent do
         task.wait(1)
-        histStats.Text = string.format("Purchases: %d | Total Spent: %s",
+        histStats.Text = string.format("Confirmed purchases: %d | Total Spent: %s",
             Sniper.PurchaseCount, tostring(Sniper.TotalSpent))
 
         for _, c in ipairs(histContainer:GetChildren()) do
@@ -1118,7 +1223,9 @@ task.spawn(function()
             local t = Instance.new("TextLabel", row)
             t.Size = UDim2.new(1, -10, 1, 0); t.Position = UDim2.new(0, 8, 0, 0)
             t.BackgroundTransparency = 1
-            t.Text = string.format("%s — %s (%s)", p.name, tostring(p.price), os.date("%H:%M:%S", p.time))
+            local status = p.confirmed and "CONFIRMED" or "UNCONFIRMED"
+            t.Text = string.format("%s — %s [%s] (%s)",
+                p.name, tostring(p.price), status, os.date("%H:%M:%S", p.time))
             t.TextColor3 = COL_TEXT; t.Font = Enum.Font.GothamSemibold
             t.TextSize = 10; t.TextXAlignment = Enum.TextXAlignment.Left
         end
