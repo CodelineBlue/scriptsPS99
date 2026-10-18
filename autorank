@@ -1,8 +1,8 @@
 --[[
     Nexus Hub - Auto Rank Edition (Pet Simulator 99)
     Fully GUI-driven. Keybind: RightShift to show/hide.
-    Includes: Max Hatch (up to 99), Hide Egg UI, Auto Tap, Auto Collect Orbs,
-    and parallel quest handlers (all active quests progress at once).
+    Includes: Max Hatch (up to 99), Auto-break Eggs (GlobalInstantHatch + animation stub),
+    Hide Egg UI, Auto Tap, Auto Collect Orbs, and parallel quest handlers.
 ]]
 
 local players             = game:GetService("Players")
@@ -313,7 +313,9 @@ local function hatchQty()
 end
 
 -- =====================================================================
--- HIDE EGG UI (ported from DZ Hub)
+-- HIDE EGG UI + AUTO-BREAK SETUP (ported from DZ Hub)
+-- This is what actually makes hatched eggs BREAK. Without it the eggs
+-- spawn and then sit there waiting for a tap that never comes.
 -- =====================================================================
 local eggUIState = {
     animEnv = nil, animOriginal = nil,
@@ -386,10 +388,17 @@ local function setEggUIHidden(on)
     if on then clearStuckPrompt() end
 end
 
+-- Auto-break is forced on whenever hatch happens, regardless of the HideEggUI toggle
+local function ensureEggBreak()
+    if not eggUIState.instantStored then
+        pcall(function() setEggUIHidden(true) end)
+    end
+end
+
 task.spawn(function()
     while task.wait(1) do
         if not getgenv().Nexus_IsRunning then break end
-        if val2.HideEggUI then clearStuckPrompt() end
+        if val2.HideEggUI or eggUIState.instantStored then clearStuckPrompt() end
     end
 end)
 
@@ -781,10 +790,11 @@ task.spawn(function()
 end)
 
 -- =====================================================================
--- QUEST HANDLERS (each runs in its own 1Hz loop -> parallel)
+-- QUEST HANDLERS
 -- =====================================================================
 local function handleLegendary(q)
     getgenv().DoingLegendaryQuest = true
+    ensureEggBreak()   -- force auto-break so purchased eggs open
     local eggName = bestEggNameForCurrentZone()
     if not eggName then rememberFailedQuest(q.raw); return end
     local idx = 0
@@ -821,6 +831,7 @@ local function handleLegendary(q)
 end
 
 local function handleHatch(q)
+    ensureEggBreak()   -- force auto-break so purchased eggs open
     local eggName = bestEggNameForCurrentZone()
     if not eggName then rememberFailedQuest(q.raw); return end
     if currentZoneByPosition() ~= bestUnlockedZone() and not getgenv().DoingLegendaryQuest then
@@ -902,6 +913,7 @@ end
 
 local function handleGold(q)
     if not hasZoneAtLeast(31) then return end
+    ensureEggBreak()
     local eggName = bestEggNameForCurrentZone()
     local set = eggName and eggPets(eggName) or {}
     local pool, total = {}, 0
@@ -956,6 +968,7 @@ end
 
 local function handleRainbow(q)
     if not hasZoneAtLeast(41) then return end
+    ensureEggBreak()
     local eggName = bestEggNameForCurrentZone()
     local set = eggName and eggPets(eggName) or {}
     local base, rain, baseT, rainT = {}, {}, 0, 0
@@ -1103,9 +1116,6 @@ local function handleLucky(q)
     else rememberFailedQuest(q.raw) end
 end
 
--- =====================================================================
--- Spawn each handler as its own 1Hz loop -> all active quests run in parallel
--- =====================================================================
 local handlers = {
     { name = "Legendary", enabled = function() return val3.Legendary end,
       match = function(t) return t:find("legendary") ~= nil end, run = handleLegendary },
@@ -1344,7 +1354,7 @@ local function section(label)
     l.Font = FONT; l.TextSize = 10; l.TextXAlignment = Enum.TextXAlignment.Left
 end
 
-local function toggle(label, tbl, key)
+local function toggle(label, tbl, key, onChange)
     local b = Instance.new("TextButton", scroll)
     b.Size = UDim2.new(1, -10, 0, 28)
     b.BackgroundColor3 = tbl[key] and C.ok or C.off
@@ -1358,6 +1368,7 @@ local function toggle(label, tbl, key)
         tbl[key] = not tbl[key]
         b.BackgroundColor3 = tbl[key] and C.ok or C.off
         b.Text = (tbl[key] and "[ON]  " or "[OFF] ") .. label
+        if onChange then pcall(onChange, tbl[key]) end
     end)
     return b
 end
@@ -1423,7 +1434,11 @@ local function txtInput(label, get, set)
 end
 
 section("MAIN FEATURES")
-toggle("Auto Rank Quests",  val2, "Rank")
+toggle("Auto Rank Quests",  val2, "Rank", function(state)
+    if not state and not val2.HideEggUI and eggUIState.instantStored then
+        pcall(function() setEggUIHidden(false) end)
+    end
+end)
 toggle("Auto Farm Area",    val2, "AutoFarmArea")
 toggle("Auto Buy Zones",    val2, "BuyZone")
 toggle("Anti AFK",          val2, "AntiAFK")
@@ -1441,9 +1456,8 @@ toggle("Auto Collect Orbs", val2, "AutoCollectOrbs")
 section("EGG HATCHING")
 slider("Hatch Cap (per tick)", function() return getgenv().HatchCap end,
     function(v) getgenv().HatchCap = math.floor(v) end, 1, 99, 1)
-local hideEggToggle = toggle("Hide Egg Hatching UI", val2, "HideEggUI")
-hideEggToggle.MouseButton1Click:Connect(function()
-    pcall(function() setEggUIHidden(val2.HideEggUI) end)
+toggle("Hide Egg Hatching UI", val2, "HideEggUI", function(state)
+    pcall(function() setEggUIHidden(state) end)
 end)
 
 section("AUTO BUNDLES")
@@ -1557,7 +1571,7 @@ task.spawn(function()
             else parts[#parts+1] = "Rank: OFF" end
             if val2.AutoTap then parts[#parts+1] = "Tap: ON" end
             if val2.AutoCollectOrbs then parts[#parts+1] = "Orbs: ON" end
-            if val2.HideEggUI then parts[#parts+1] = "EggUI: OFF" end
+            if eggUIState.instantStored then parts[#parts+1] = "Auto-break: ON" end
             if val2.AutoFarmArea then parts[#parts+1] = "Farm: ON" end
             status.Text = table.concat(parts, "  |  ")
         end)
