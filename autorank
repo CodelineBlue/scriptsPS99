@@ -1,7 +1,8 @@
 --[[
     Nexus Hub - Auto Rank Edition (Pet Simulator 99)
-    Fully GUI-driven. No code edits required.
-    Keybind: RightShift to show/hide.
+    Fully GUI-driven. Keybind: RightShift to show/hide.
+    Includes: Max Hatch (up to 99), Hide Egg UI, Auto Tap, Auto Collect Orbs,
+    and parallel quest handlers (all active quests progress at once).
 ]]
 
 local players             = game:GetService("Players")
@@ -20,21 +21,31 @@ getgenv().IsDoingSpecificQuest  = false
 getgenv().DoingLegendaryQuest   = false
 getgenv().LegendaryEggOffset    = getgenv().LegendaryEggOffset or 1
 getgenv().TargetUltimate        = getgenv().TargetUltimate or "Ground Pound"
+getgenv().TapRate               = getgenv().TapRate or 8
+getgenv().TapRadius             = getgenv().TapRadius or 150
+getgenv().HatchCap              = getgenv().HatchCap or 99
 
-local library
+local library, G_Map, G_Break, G_Eggs, G_Settings
 pcall(function()
-    library = require(replicatedStorage:WaitForChild("Library"):WaitForChild("Client"):WaitForChild("Save"))
+    local c = replicatedStorage:WaitForChild("Library"):WaitForChild("Client")
+    library    = require(c:WaitForChild("Save"))
+    G_Map      = require(c:WaitForChild("MapCmds"))
+    G_Break    = require(c:WaitForChild("BreakableFrontend"))
+    G_Eggs     = require(c:WaitForChild("EggCmds"))
+    G_Settings = require(c:WaitForChild("SettingsCmds"))
 end)
 pcall(function() require(replicatedStorage:WaitForChild("Library")) end)
 
 -- =====================================================================
--- TOGGLE TABLES (every boolean here is GUI-driven)
+-- TOGGLES
 -- =====================================================================
 local val2 = {
     Rank = true, AutoFarmArea = true, BuyZone = true, AntiAFK = true,
     Ultimate = false, AutoClaimMail = false,
     AutoBundleEnchant = false, AutoBundlePotion = false,
     AutoBundleFruit = false, AutoBundleFlag = false,
+    AutoTap = false, AutoCollectOrbs = false,
+    HideEggUI = false,
 }
 
 local val3 = {
@@ -91,10 +102,7 @@ pcall(function()
                 local n = string.match(m.Name, "^(%d+)")
                 local s = string.match(m.Name, "%d+%s*|%s*(.+)")
                 if n and s then
-                    local num = tonumber(n)
-                    val8[s]   = num
-                    val8[m.Name] = num
-                    val9[num] = s
+                    val8[s] = tonumber(n); val8[m.Name] = tonumber(n); val9[tonumber(n)] = s
                 end
             end
         end
@@ -131,9 +139,7 @@ local function mapZones()
         local m = workspace:FindFirstChild(n)
         if m then
             for _, z in ipairs(m:GetChildren()) do
-                if not string.find(string.lower(z.Name), "vip") then
-                    table.insert(out, z)
-                end
+                if not string.find(string.lower(z.Name), "vip") then table.insert(out, z) end
             end
         end
     end
@@ -218,8 +224,8 @@ local function buildEggList()
                 elseif (p == 140403681187145 or p == 17720827393) and n < 240 then allowed = false end
                 if allowed then
                     local name = string.match(m.Name, "|%s*(.+)") or m.Name
-                    getgenv().EggNameToNumber[name]      = n
-                    getgenv().EggNumberToName[n]         = name
+                    getgenv().EggNameToNumber[name] = n
+                    getgenv().EggNumberToName[n]    = name
                     table.insert(out, { name = name, num = n, zoneNum = d.zoneNumber or n })
                 end
             end
@@ -281,6 +287,111 @@ local function bestEggNameForCurrentZone()
     end
     return name
 end
+
+-- =====================================================================
+-- MAX HATCH HELPERS
+-- =====================================================================
+local function maxHatchCount()
+    if G_Eggs then
+        local ok, v = pcall(G_Eggs.GetMaxHatch)
+        if ok and tonumber(v) then return math.max(1, math.floor(v)) end
+    end
+    if library then
+        local ok, d = pcall(function() return library.Get() end)
+        if ok and d then
+            local n = tonumber(d.EggHatchCount) or tonumber(d.MaxEggHatch) or tonumber(d.EggSlotsPurchased)
+            if n then return math.max(1, math.floor(n)) end
+        end
+    end
+    return 1
+end
+
+local function hatchQty()
+    local cap = tonumber(getgenv().HatchCap) or 99
+    local gameMax = maxHatchCount()
+    return math.max(1, math.min(cap, gameMax))
+end
+
+-- =====================================================================
+-- HIDE EGG UI (ported from DZ Hub)
+-- =====================================================================
+local eggUIState = {
+    animEnv = nil, animOriginal = nil,
+    potatoOriginal = nil,
+    instantStored = false, instantOriginal = nil,
+}
+
+local function clearStuckPrompt()
+    for _, raiz in ipairs({ game:GetService("CoreGui"), localPlayer:FindFirstChild("PlayerGui") }) do
+        if raiz then
+            for _, g in ipairs(raiz:GetDescendants()) do
+                if g.Name == "TapToOpen" then pcall(function() g:Destroy() end) end
+            end
+        end
+    end
+end
+
+local function killPlayEggAnimation(on)
+    if type(getsenv) ~= "function" then return end
+    pcall(function()
+        if on then
+            if eggUIState.animOriginal then return end
+            local ps = localPlayer:FindFirstChild("PlayerScripts")
+            local sc = ps and ps:FindFirstChild("Scripts")
+            local gameEnv = sc and sc:FindFirstChild("Game")
+            local frontend = gameEnv and gameEnv:FindFirstChild("Egg Opening Frontend")
+            if not frontend then return end
+            local env = getsenv(frontend)
+            if type(env) ~= "table" or type(env.PlayEggAnimation) ~= "function" then return end
+            eggUIState.animEnv = env
+            eggUIState.animOriginal = env.PlayEggAnimation
+            env.PlayEggAnimation = function() end
+        elseif eggUIState.animOriginal and eggUIState.animEnv then
+            eggUIState.animEnv.PlayEggAnimation = eggUIState.animOriginal
+            eggUIState.animOriginal = nil
+            eggUIState.animEnv = nil
+        end
+    end)
+end
+
+local function setEggUIHidden(on)
+    killPlayEggAnimation(on)
+
+    if G_Settings then
+        if on and not eggUIState.potatoOriginal then
+            eggUIState.potatoOriginal = G_Settings.Get
+            G_Settings.Get = function(label, ...)
+                if label == "EggPotatoMode" then return "On" end
+                return eggUIState.potatoOriginal(label, ...)
+            end
+        elseif not on and eggUIState.potatoOriginal then
+            G_Settings.Get = eggUIState.potatoOriginal
+            eggUIState.potatoOriginal = nil
+        end
+    end
+
+    pcall(function()
+        if on then
+            if not eggUIState.instantStored then
+                eggUIState.instantOriginal = workspace:GetAttribute("GlobalInstantHatch")
+                eggUIState.instantStored = true
+            end
+            workspace:SetAttribute("GlobalInstantHatch", true)
+        elseif eggUIState.instantStored then
+            workspace:SetAttribute("GlobalInstantHatch", eggUIState.instantOriginal)
+            eggUIState.instantStored = false
+        end
+    end)
+
+    if on then clearStuckPrompt() end
+end
+
+task.spawn(function()
+    while task.wait(1) do
+        if not getgenv().Nexus_IsRunning then break end
+        if val2.HideEggUI then clearStuckPrompt() end
+    end
+end)
 
 -- =====================================================================
 -- QUEST READER
@@ -361,13 +472,19 @@ local function currentZoneByPosition()
         local pos = pivotPosition(z)
         if pos ~= Vector3.new(0, 0, 0) then
             local m = (hrp.Position - pos).Magnitude
-            if m < closest then
-                closest = m
-                bestNum = zoneNumberFromName(z.Name, game.PlaceId) or 0
-            end
+            if m < closest then closest = m; bestNum = zoneNumberFromName(z.Name, game.PlaceId) or 0 end
         end
     end
     return bestNum
+end
+
+local function currentZoneName()
+    if G_Map then
+        local ok, z = pcall(G_Map.GetCurrentZone)
+        if ok and type(z) == "string" then return z end
+    end
+    local n = currentZoneByPosition()
+    return n and val9[n] or nil
 end
 
 local function teleportToBreakable(zone)
@@ -458,15 +575,9 @@ local function machineAction(evt, method, a, b)
     local r = network:FindFirstChild(evt)
     if not r then return end
     local log = network:FindFirstChild("EventLog_Once")
-    if log then
-        pcall(function() log:FireServer("OpenTab", method) end)
-        task.wait(0.1)
-    end
+    if log then pcall(function() log:FireServer("OpenTab", method) end); task.wait(0.1) end
     pcall(function() r:InvokeServer(a, b) end)
-    if log then
-        task.wait(0.1)
-        pcall(function() log:FireServer("CloseTab", method) end)
-    end
+    if log then task.wait(0.1); pcall(function() log:FireServer("CloseTab", method) end) end
 end
 
 local function gotoAndUseMachine(zoneNum, marker)
@@ -484,9 +595,9 @@ end
 
 local function collectPotionForCraft(tier)
     local pool = { "Coins", "Damage", "Diamonds", "Lucky Eggs", "Treasure Hunter" }
-    if not library then return nil, nil end
+    if not library then return nil end
     local ok, d = pcall(function() return library.Get() end)
-    if not ok or not d or not d.Inventory or not d.Inventory.Potion then return nil, nil end
+    if not ok or not d or not d.Inventory or not d.Inventory.Potion then return nil end
     for _, name in ipairs(pool) do
         local uid, pt = nil, 999
         for k, item in pairs(d.Inventory.Potion) do
@@ -494,15 +605,13 @@ local function collectPotionForCraft(tier)
                 local t = tonumber(item.tn) or 1
                 local amt = tonumber(item._am) or 1
                 if tier then
-                    if t == tonumber(tier) and amt >= 1 then return k, name end
-                elseif t < pt and amt >= 1 then
-                    pt, uid = t, k
-                end
+                    if t == tonumber(tier) and amt >= 1 then return k end
+                elseif t < pt and amt >= 1 then pt, uid = t, k end
             end
         end
-        if not tier and uid then return uid, name end
+        if not tier and uid then return uid end
     end
-    return nil, nil
+    return nil
 end
 
 local function findUpgradeBundle(kind, amount, minTier)
@@ -522,7 +631,7 @@ local function findUpgradeBundle(kind, amount, minTier)
                     local c = math.floor((tonumber(item._am) or 1) / 5)
                     if c > 0 then
                         local u = math.min(c, rem)
-                        table.insert(res, { uid = uid, name = name, crafts = u })
+                        table.insert(res, { uid = uid, crafts = u })
                         rem = rem - u
                         if rem <= 0 then return res end
                     end
@@ -543,7 +652,7 @@ local function findUpgradeBundle(kind, amount, minTier)
                             local c = math.floor((tonumber(item._am) or 1) / 5)
                             if c > 0 then
                                 local u = math.min(c, rem)
-                                table.insert(res, { uid = uid, name = name, crafts = u })
+                                table.insert(res, { uid = uid, crafts = u })
                                 rem = rem - u
                                 if rem <= 0 then return res end
                             end
@@ -557,18 +666,101 @@ local function findUpgradeBundle(kind, amount, minTier)
 end
 
 -- =====================================================================
--- AUTORANK STATE
+-- STATE
 -- =====================================================================
-local val100       = 0
-local val101       = 0
-local val102       = {}
-local val103       = { "Rainbow Fruit", "Watermelon", "Pineapple", "Orange", "Banana", "Apple" }
-local val104       = 1
-local prog         = -1
-local val105       = { i = 1, ii = 2, iii = 3, iv = 4, v = 5, vi = 6, vii = 7, viii = 8, ix = 9, x = 10 }
+local val100 = 0
+local val103 = { "Rainbow Fruit", "Watermelon", "Pineapple", "Orange", "Banana", "Apple" }
+local val104 = 1
+local prog   = -1
+local val105 = { i = 1, ii = 2, iii = 3, iv = 4, v = 5, vi = 6, vii = 7, viii = 8, ix = 9, x = 10 }
+local val102 = {}
+local lastUse = {}
 
 local function rememberFailedQuest(raw) if raw then val102[raw] = tick() + 60 end end
 local function isQuestBlacklisted(raw) return val102[raw] and tick() < val102[raw] end
+local function canUse(key, gap)
+    local now = tick()
+    if (lastUse[key] or 0) + gap > now then return false end
+    lastUse[key] = now
+    return true
+end
+
+-- =====================================================================
+-- AUTO TAP NEARBY BREAKABLES
+-- =====================================================================
+task.spawn(function()
+    while true do
+        local rate = math.clamp(getgenv().TapRate or 8, 1, 16)
+        task.wait(1 / rate)
+        if not getgenv().Nexus_IsRunning then break end
+        if not val2.AutoTap then continue end
+        if getgenv().IsMachineActionActive then continue end
+
+        pcall(function()
+            local hrp = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if not hrp then return end
+            local zoneName = currentZoneName()
+            if not zoneName then return end
+            local radius = getgenv().TapRadius or 150
+            local dmg = network:FindFirstChild("Breakables_PlayerDealDamage")
+            if not dmg then return end
+
+            if G_Break then
+                for _, class in ipairs({ "Normal", "Chest" }) do
+                    local ok, list = pcall(G_Break.AllByZoneAndClass, zoneName, class)
+                    if ok and type(list) == "table" then
+                        for _, b in pairs(list) do
+                            if b.uid and b.position
+                                and (b.health == nil or b.health > 0)
+                                and (b.position - hrp.Position).Magnitude <= radius then
+                                pcall(function() dmg:FireServer(b.uid) end)
+                            end
+                        end
+                    end
+                end
+            else
+                local things = workspace:FindFirstChild("__THINGS")
+                local br = things and things:FindFirstChild("Breakables")
+                if br then
+                    for _, m in ipairs(br:GetChildren()) do
+                        pcall(function()
+                            local pos = m:GetPivot().Position
+                            if (pos - hrp.Position).Magnitude <= radius then
+                                dmg:FireServer(m.Name)
+                            end
+                        end)
+                    end
+                end
+            end
+        end)
+    end
+end)
+
+-- =====================================================================
+-- AUTO COLLECT ORBS
+-- =====================================================================
+task.spawn(function()
+    while task.wait(0.2) do
+        if not getgenv().Nexus_IsRunning then break end
+        if not val2.AutoCollectOrbs then continue end
+        if getgenv().IsMachineActionActive then continue end
+        pcall(function()
+            local things = workspace:FindFirstChild("__THINGS")
+            local orbs = things and things:FindFirstChild("Orbs")
+            if not orbs then return end
+            local kids = orbs:GetChildren()
+            if #kids == 0 then return end
+            local list = {}
+            for _, o in ipairs(kids) do
+                local id = tonumber(o.Name)
+                if id then table.insert(list, id) end
+            end
+            if #list == 0 then return end
+            local collect = network:FindFirstChild("Orbs: Collect")
+            if collect then pcall(function() collect:FireServer(list) end) end
+        end)
+    end
+end)
 
 -- =====================================================================
 -- RANK CLAIM LOOP
@@ -581,10 +773,7 @@ task.spawn(function()
             task.spawn(function()
                 local c = network:FindFirstChild("Ranks_ClaimReward")
                 if c then
-                    for i = 1, 99 do
-                        pcall(function() c:FireServer(i) end)
-                        task.wait(0.02)
-                    end
+                    for i = 1, 99 do pcall(function() c:FireServer(i) end); task.wait(0.02) end
                 end
             end)
         end
@@ -592,389 +781,383 @@ task.spawn(function()
 end)
 
 -- =====================================================================
--- MAIN AUTORANK LOOP
+-- QUEST HANDLERS (each runs in its own 1Hz loop -> parallel)
 -- =====================================================================
-task.spawn(function()
-    while task.wait(1) do
-        if not getgenv().Nexus_IsRunning then break end
-        if not (val2.Rank and hasZoneAtLeast(41)) then continue end
+local function handleLegendary(q)
+    getgenv().DoingLegendaryQuest = true
+    local eggName = bestEggNameForCurrentZone()
+    if not eggName then rememberFailedQuest(q.raw); return end
+    local idx = 0
+    for i, e in ipairs(val31) do if e.name == eggName then idx = i; break end end
+    local off = getgenv().LegendaryEggOffset or 1
+    local target = idx > off and val31[idx - off].name or val31[1].name
+    local n = getgenv().EggNameToNumber[target]
+    local tn = n and tostring(n) .. " - Egg Capsule" or ""
+    local egg, things = nil, workspace:FindFirstChild("__THINGS")
+    if things then
+        if game.PlaceId == 17503543197 then
+            egg = things:FindFirstChild("Eggs") and things.Eggs:FindFirstChild(tn, true)
+        end
+        if not egg then
+            egg = things:FindFirstChild("ZoneEggs") and things.ZoneEggs:FindFirstChild(tn, true)
+        end
+        if not egg then
+            egg = things:FindFirstChild("Eggs") and things.Eggs:FindFirstChild(tn, true)
+        end
+    end
+    local hrp = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if hrp and egg and (hrp.Position - egg:GetPivot().Position).Magnitude > 50 then
+        getgenv().IsMachineActionActive = true
+        teleportToEgg(target)
+        task.wait(0.5)
+        getgenv().IsMachineActionActive = false
+    end
+    task.spawn(function()
         pcall(function()
-            local quests = readQuests()
-            for _, q in ipairs(quests) do
-                if isQuestBlacklisted(q.raw) then continue end
-                local txt, done = q.txt, false
+            network:FindFirstChild("Eggs_RequestPurchase"):InvokeServer(target, hatchQty())
+        end)
+    end)
+    task.wait(0.1)
+end
 
-                if val3.Legendary and string.find(txt, "legendary") then
-                    getgenv().DoingLegendaryQuest = true
-                    local eggName = bestEggNameForCurrentZone()
-                    if eggName then
-                        local idx = 0
-                        for i, e in ipairs(val31) do if e.name == eggName then idx = i; break end end
-                        local off = getgenv().LegendaryEggOffset or 1
-                        local target = idx > off and val31[idx - off].name or val31[1].name
-                        local n = getgenv().EggNameToNumber[target]
-                        local tn = n and tostring(n) .. " - Egg Capsule" or ""
-                        local egg, things = nil, workspace:FindFirstChild("__THINGS")
-                        if things then
-                            if game.PlaceId == 17503543197 then
-                                egg = things:FindFirstChild("Eggs") and things.Eggs:FindFirstChild(tn, true)
-                            end
-                            if not egg then
-                                egg = things:FindFirstChild("ZoneEggs") and things.ZoneEggs:FindFirstChild(tn, true)
-                            end
-                            if not egg then
-                                egg = things:FindFirstChild("Eggs") and things.Eggs:FindFirstChild(tn, true)
-                            end
-                        end
-                        local hrp = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
-                        if hrp and egg and (hrp.Position - egg:GetPivot().Position).Magnitude > 50 then
-                            getgenv().IsMachineActionActive = true
-                            teleportToEgg(target)
-                            task.wait(0.5)
-                            getgenv().IsMachineActionActive = false
-                        end
-                        task.spawn(function()
-                            pcall(function() network:FindFirstChild("Eggs_RequestPurchase"):InvokeServer(target, 1) end)
-                        end)
-                        task.wait(0.1)
-                    else
-                        rememberFailedQuest(q.raw)
-                    end
-                    done = true
+local function handleHatch(q)
+    local eggName = bestEggNameForCurrentZone()
+    if not eggName then rememberFailedQuest(q.raw); return end
+    if currentZoneByPosition() ~= bestUnlockedZone() and not getgenv().DoingLegendaryQuest then
+        getgenv().IsMachineActionActive = true
+        teleportToBestArea()
+        task.wait(0.5)
+        getgenv().IsMachineActionActive = false
+    end
+    local qty = hatchQty()
+    task.spawn(function()
+        pcall(function()
+            network:FindFirstChild("Eggs_RequestPurchase"):InvokeServer(eggName, qty)
+        end)
+    end)
+    task.wait(0.1)
+end
 
-                elseif val3.Hatch and string.find(txt, "hatch") and not string.find(txt, "legendary") then
-                    local eggName = bestEggNameForCurrentZone()
-                    if eggName then
-                        if currentZoneByPosition() ~= bestUnlockedZone() and not getgenv().DoingLegendaryQuest then
-                            getgenv().IsMachineActionActive = true
-                            teleportToBestArea()
-                            task.wait(0.5)
-                            getgenv().IsMachineActionActive = false
-                        end
-                        task.spawn(function()
-                            pcall(function() network:FindFirstChild("Eggs_RequestPurchase"):InvokeServer(eggName, 1) end)
-                        end)
-                        task.wait(0.1)
-                    else rememberFailedQuest(q.raw) end
-                    done = true
+local function handlePotion(q)
+    if not canUse("potion", 1.25) then return end
+    local tt = string.match(q.txt, "tier%s+([ivx%d]+)")
+    local tier = val105[tt] or tonumber(tt) or 1
+    local uid = collectPotionForCraft(tier)
+    if uid then
+        for _ = 1, q.remaining do
+            pcall(function() network:FindFirstChild("Potions: Consume"):FireServer(uid, 1) end)
+            task.wait(0.1)
+        end
+    else rememberFailedQuest(q.raw) end
+end
 
-                elseif val3.Potion and (string.find(txt, "drink") or string.find(txt, "use"))
-                    and string.find(txt, "potion") then
-                    if tick() - val101 >= 1.25 then
-                        local tt = string.match(txt, "tier%s+([ivx%d]+)")
-                        local tier = val105[tt] or tonumber(tt) or 1
-                        local uid = collectPotionForCraft(tier)
-                        if uid then
-                            for _ = 1, q.remaining do
-                                pcall(function() network:FindFirstChild("Potions: Consume"):FireServer(uid, 1) end)
-                                task.wait(0.1)
-                            end
-                            val101 = tick()
-                            rememberFailedQuest(q.raw)
-                        else rememberFailedQuest(q.raw) end
-                    end
-                    done = true
-
-                elseif val3.Area and (string.find(txt, "unlock") or string.find(txt, "reach"))
-                    and string.find(txt, "area") then
-                    local curr = currentZoneByPosition()
-                    for _, z in ipairs(mapZones()) do
-                        if tonumber(string.match(z.Name, "^(%d+)")) == curr + 1 then
-                            local name = string.match(z.Name, "%d+%s*|%s*(.+)") or z.Name
-                            if name then
-                                pcall(function()
-                                    network:FindFirstChild("Zones_RequestPurchase"):InvokeServer(name)
-                                end)
-                                task.wait(0.5)
-                                teleportToBestArea()
-                            end
-                            break
-                        end
-                    end
-                    done = true
-
-                elseif val3.UpPotion
-                    and ((string.find(txt, "potion") and string.find(txt, "upgrade"))
-                      or (string.find(txt, "collect") and string.find(txt, "potion")))
-                    and hasZoneAtLeast(13) then
-                    local tt = string.match(txt, "tier%s+([ivx%d]+)")
-                    local tier = val105[tt] or tonumber(tt)
-                    local b = findUpgradeBundle("Potion", q.remaining, tier)
-                    if b and #b > 0 then
-                        getgenv().IsDoingSpecificQuest = true
-                        gotoAndUseMachine(13, "UpgradePotionsMachine")
-                        for _, u in ipairs(b) do
-                            machineAction("UpgradePotionsMachine_Activate", "UpgradePotionsMachine", u.uid, u.crafts)
-                            task.wait(0.2)
-                        end
-                        getgenv().IsDoingSpecificQuest = false
-                        rememberFailedQuest(q.raw)
-                    else rememberFailedQuest(q.raw) end
-                    done = true
-
-                elseif val3.UpEnchant
-                    and ((string.find(txt, "enchant") and string.find(txt, "upgrade"))
-                      or (string.find(txt, "collect") and string.find(txt, "enchant")))
-                    and hasZoneAtLeast(16) then
-                    local tt = string.match(txt, "tier%s+([ivx%d]+)")
-                    local tier = val105[tt] or tonumber(tt)
-                    local b = findUpgradeBundle("Enchant", q.remaining, tier)
-                    if b and #b > 0 then
-                        getgenv().IsDoingSpecificQuest = true
-                        gotoAndUseMachine(16, "UpgradeEnchantsMachine")
-                        for _, u in ipairs(b) do
-                            machineAction("UpgradeEnchantsMachine_Activate", "UpgradeEnchantsMachine", u.uid, u.crafts)
-                            task.wait(0.2)
-                        end
-                        getgenv().IsDoingSpecificQuest = false
-                        rememberFailedQuest(q.raw)
-                    else rememberFailedQuest(q.raw) end
-                    done = true
-
-                elseif val3.Gold and string.find(txt, "golden") and hasZoneAtLeast(31) then
-                    local eggName = bestEggNameForCurrentZone()
-                    local set = eggName and eggPets(eggName) or {}
-                    local pool, total = {}, 0
-                    if library then
-                        pcall(function()
-                            for uid, pet in pairs(library.Get().Inventory.Pet) do
-                                if not pet.l and not pet.locked and not pet.lk
-                                    and (tonumber(pet.pt) or 0) == 0 then
-                                    local id, m = tostring(pet.id), false
-                                    for k in pairs(set) do
-                                        if id == k or string.find(id, k) or string.find(k, id) then m = true; break end
-                                    end
-                                    if m then
-                                        local c = math.floor((tonumber(pet._am) or 1) / 10)
-                                        if c > 0 then
-                                            table.insert(pool, { uid = uid, crafts = c })
-                                            total = total + c
-                                        end
-                                    end
-                                end
-                            end
-                        end)
-                    end
-                    if total > 0 then
-                        local used, rem = {}, q.remaining
-                        table.sort(pool, function(a, b) return a.crafts > b.crafts end)
-                        for _, p in ipairs(pool) do
-                            if rem > 0 then
-                                local u = math.min(p.crafts, rem)
-                                table.insert(used, { uid = p.uid, amt = u })
-                                rem = rem - u
-                            end
-                        end
-                        if #used > 0 then
-                            getgenv().IsDoingSpecificQuest = true
-                            gotoAndUseMachine(31, "GoldMachine")
-                            for _, u in ipairs(used) do
-                                machineAction("GoldMachine_Activate", "GoldMachine", u.uid, u.amt)
-                                task.wait(0.2)
-                            end
-                            getgenv().IsDoingSpecificQuest = false
-                        end
-                    end
-                    if total < q.remaining and eggName then
-                        if currentZoneByPosition() ~= bestUnlockedZone() then
-                            getgenv().IsMachineActionActive = true
-                            teleportToBestArea()
-                            task.wait(0.5)
-                            getgenv().IsMachineActionActive = false
-                        end
-                        task.spawn(function()
-                            pcall(function() network:FindFirstChild("Eggs_RequestPurchase"):InvokeServer(eggName, 1) end)
-                        end)
-                        task.wait(0.1)
-                    end
-                    done = true
-
-                elseif val3.Rainbow and string.find(txt, "rainbow") and hasZoneAtLeast(41) then
-                    local eggName = bestEggNameForCurrentZone()
-                    local set = eggName and eggPets(eggName) or {}
-                    local base, rain, baseT, rainT = {}, {}, 0, 0
-                    if library then
-                        pcall(function()
-                            for uid, pet in pairs(library.Get().Inventory.Pet) do
-                                if not pet.l and not pet.locked and not pet.lk then
-                                    local pt = tonumber(pet.pt) or 0
-                                    if pt == 0 or pt == 1 then
-                                        local id, m = tostring(pet.id), false
-                                        for k in pairs(set) do
-                                            if id == k or string.find(id, k) or string.find(k, id) then m = true; break end
-                                        end
-                                        if m then
-                                            local c = math.floor((tonumber(pet._am) or 1) / 10)
-                                            if c > 0 then
-                                                if pt == 0 then
-                                                    table.insert(base, { uid = uid, crafts = c }); baseT = baseT + c
-                                                else
-                                                    table.insert(rain, { uid = uid, crafts = c }); rainT = rainT + c
-                                                end
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-                        end)
-                    end
-                    if rainT > 0 then
-                        local used, rem = {}, q.remaining
-                        table.sort(rain, function(a, b) return a.crafts > b.crafts end)
-                        for _, p in ipairs(rain) do
-                            if rem > 0 then
-                                local u = math.min(p.crafts, rem)
-                                table.insert(used, { uid = p.uid, amt = u }); rem = rem - u
-                            end
-                        end
-                        if #used > 0 then
-                            getgenv().IsDoingSpecificQuest = true
-                            gotoAndUseMachine(41, "RainbowMachine")
-                            for _, u in ipairs(used) do
-                                machineAction("RainbowMachine_Activate", "RainbowMachine", u.uid, u.amt)
-                                task.wait(0.2)
-                            end
-                            getgenv().IsDoingSpecificQuest = false
-                        end
-                    end
-                    if rainT < q.remaining then
-                        if baseT > 0 then
-                            local used, rem = {}, (q.remaining - rainT) * 10
-                            table.sort(base, function(a, b) return a.crafts > b.crafts end)
-                            for _, p in ipairs(base) do
-                                if rem > 0 then
-                                    local u = math.min(p.crafts, rem)
-                                    table.insert(used, { uid = p.uid, amt = u }); rem = rem - u
-                                end
-                            end
-                            if #used > 0 then
-                                getgenv().IsDoingSpecificQuest = true
-                                gotoAndUseMachine(31, "GoldMachine")
-                                for _, u in ipairs(used) do
-                                    machineAction("GoldMachine_Activate", "GoldMachine", u.uid, u.amt)
-                                    task.wait(0.2)
-                                end
-                                getgenv().IsDoingSpecificQuest = false
-                            end
-                        end
-                        if rainT * 10 + baseT < q.remaining * 10 and eggName then
-                            if currentZoneByPosition() ~= bestUnlockedZone() then
-                                getgenv().IsMachineActionActive = true
-                                teleportToBestArea()
-                                task.wait(0.5)
-                                getgenv().IsMachineActionActive = false
-                            end
-                            task.spawn(function()
-                                pcall(function() network:FindFirstChild("Eggs_RequestPurchase"):InvokeServer(eggName, 1) end)
-                            end)
-                            task.wait(0.1)
-                        end
-                    end
-                    done = true
-
-                elseif val3.Flag and string.find(txt, "flag") then
-                    if tick() - val101 >= 1.25 then
-                        local flags = { "Fortune Flag", "Strength Flag", "Magnet Flag", "Coins Flag",
-                                        "Hasty Flag", "Diamonds Flag", "Rainbow Flag", "Shiny Flag" }
-                        local used = false
-                        for _, f in ipairs(flags) do
-                            local uid = findItemUid(f, false)
-                            if uid then
-                                pcall(function()
-                                    network:FindFirstChild("FlexibleFlags_Consume"):InvokeServer(f, uid)
-                                end)
-                                val101 = tick(); used = true; break
-                            end
-                        end
-                        if not used then rememberFailedQuest(q.raw) end
-                    end
-                    done = true
-
-                elseif val3.Fruit and string.find(txt, "fruit") then
-                    if tick() - val101 >= 1.25 then
-                        if prog ~= -1 and q.remaining == prog then
-                            val104 = val104 + 1
-                            if val104 > #val103 then val104 = 1 end
-                        end
-                        local fruit = val103[val104]
-                        local uid = findItemUid(fruit, false)
-                            or findItemUid(fruit == "Rainbow Fruit" and "Rainbow" or fruit:gsub(" ", ""), false)
-                        if uid then
-                            pcall(function() network:FindFirstChild("Fruits: Consume"):FireServer(uid, 1) end)
-                            val101 = tick(); prog = q.remaining
-                        else rememberFailedQuest(q.raw) end
-                    end
-                    done = true
-
-                elseif val3.Comet and string.find(txt, "comet") then
-                    if tick() - val101 >= 1.25 then
-                        local uid = findItemUid("Comet", false)
-                        if uid then
-                            for _ = 1, q.remaining do
-                                pcall(function() network:FindFirstChild("Comet_Spawn"):InvokeServer(uid) end)
-                                task.wait(0.1)
-                            end
-                            val101 = tick()
-                        else rememberFailedQuest(q.raw) end
-                    end
-                    done = true
-
-                elseif val3.Jar and string.find(txt, "coin") and string.find(txt, "jar") then
-                    if tick() - val101 >= 1.25 then
-                        local uid
-                        for _, n in ipairs({ "Basic Coin Jar", "CoinJar", "Coin Jar", "Jar" }) do
-                            uid = findItemUid(n, false); if uid then break end
-                        end
-                        if uid then
-                            pcall(function() network:FindFirstChild("CoinJar_Spawn"):InvokeServer(uid) end)
-                            val101 = tick()
-                        else rememberFailedQuest(q.raw) end
-                    end
-                    done = true
-
-                elseif val3.Pinata and string.find(txt, "pinata") then
-                    if tick() - val101 >= 1.25 then
-                        local uid
-                        for _, n in ipairs({ "Mini Pinata", "MiniPinata" }) do
-                            uid = findItemUid(n, false); if uid then break end
-                        end
-                        if uid then
-                            pcall(function() network:FindFirstChild("MiniPinata_Consume"):InvokeServer(uid) end)
-                            val101 = tick()
-                        else rememberFailedQuest(q.raw) end
-                    end
-                    done = true
-
-                elseif val3.Lucky and string.find(txt, "lucky") and string.find(txt, "block") then
-                    if tick() - val101 >= 1.25 then
-                        local uid
-                        for _, n in ipairs({ "Mini Lucky Block", "MiniLuckyBlock" }) do
-                            uid = findItemUid(n, false); if uid then break end
-                        end
-                        if uid then
-                            pcall(function() network:FindFirstChild("MiniLuckyBlock_Consume"):InvokeServer(uid) end)
-                            val101 = tick()
-                        else rememberFailedQuest(q.raw) end
-                    end
-                    done = true
-                end
-
-                if done then break end
+local function handleArea(q)
+    local curr = currentZoneByPosition()
+    for _, z in ipairs(mapZones()) do
+        if tonumber(string.match(z.Name, "^(%d+)")) == curr + 1 then
+            local name = string.match(z.Name, "%d+%s*|%s*(.+)") or z.Name
+            if name then
+                pcall(function() network:FindFirstChild("Zones_RequestPurchase"):InvokeServer(name) end)
+                task.wait(0.5)
+                teleportToBestArea()
             end
+            break
+        end
+    end
+end
 
-            if getgenv().DoingLegendaryQuest then
-                getgenv().DoingLegendaryQuest = false
+local function handleUpPotion(q)
+    if not hasZoneAtLeast(13) then return end
+    local tt = string.match(q.txt, "tier%s+([ivx%d]+)")
+    local tier = val105[tt] or tonumber(tt)
+    local b = findUpgradeBundle("Potion", q.remaining, tier)
+    if b and #b > 0 then
+        getgenv().IsDoingSpecificQuest = true
+        gotoAndUseMachine(13, "UpgradePotionsMachine")
+        for _, u in ipairs(b) do
+            machineAction("UpgradePotionsMachine_Activate", "UpgradePotionsMachine", u.uid, u.crafts)
+            task.wait(0.2)
+        end
+        getgenv().IsDoingSpecificQuest = false
+        rememberFailedQuest(q.raw)
+    else rememberFailedQuest(q.raw) end
+end
+
+local function handleUpEnchant(q)
+    if not hasZoneAtLeast(16) then return end
+    local tt = string.match(q.txt, "tier%s+([ivx%d]+)")
+    local tier = val105[tt] or tonumber(tt)
+    local b = findUpgradeBundle("Enchant", q.remaining, tier)
+    if b and #b > 0 then
+        getgenv().IsDoingSpecificQuest = true
+        gotoAndUseMachine(16, "UpgradeEnchantsMachine")
+        for _, u in ipairs(b) do
+            machineAction("UpgradeEnchantsMachine_Activate", "UpgradeEnchantsMachine", u.uid, u.crafts)
+            task.wait(0.2)
+        end
+        getgenv().IsDoingSpecificQuest = false
+        rememberFailedQuest(q.raw)
+    else rememberFailedQuest(q.raw) end
+end
+
+local function handleGold(q)
+    if not hasZoneAtLeast(31) then return end
+    local eggName = bestEggNameForCurrentZone()
+    local set = eggName and eggPets(eggName) or {}
+    local pool, total = {}, 0
+    if library then
+        pcall(function()
+            for uid, pet in pairs(library.Get().Inventory.Pet) do
+                if not pet.l and not pet.locked and not pet.lk and (tonumber(pet.pt) or 0) == 0 then
+                    local id, m = tostring(pet.id), false
+                    for k in pairs(set) do
+                        if id == k or string.find(id, k) or string.find(k, id) then m = true; break end
+                    end
+                    if m then
+                        local c = math.floor((tonumber(pet._am) or 1) / 10)
+                        if c > 0 then table.insert(pool, { uid = uid, crafts = c }); total = total + c end
+                    end
+                end
+            end
+        end)
+    end
+    if total > 0 then
+        local used, rem = {}, q.remaining
+        table.sort(pool, function(a, b) return a.crafts > b.crafts end)
+        for _, p in ipairs(pool) do
+            if rem > 0 then
+                local u = math.min(p.crafts, rem)
+                table.insert(used, { uid = p.uid, amt = u }); rem = rem - u
+            end
+        end
+        if #used > 0 then
+            getgenv().IsDoingSpecificQuest = true
+            gotoAndUseMachine(31, "GoldMachine")
+            for _, u in ipairs(used) do
+                machineAction("GoldMachine_Activate", "GoldMachine", u.uid, u.amt)
+                task.wait(0.2)
+            end
+            getgenv().IsDoingSpecificQuest = false
+        end
+    end
+    if total < q.remaining and eggName then
+        if currentZoneByPosition() ~= bestUnlockedZone() then
+            getgenv().IsMachineActionActive = true
+            teleportToBestArea()
+            task.wait(0.5)
+            getgenv().IsMachineActionActive = false
+        end
+        task.spawn(function()
+            pcall(function() network:FindFirstChild("Eggs_RequestPurchase"):InvokeServer(eggName, hatchQty()) end)
+        end)
+        task.wait(0.1)
+    end
+end
+
+local function handleRainbow(q)
+    if not hasZoneAtLeast(41) then return end
+    local eggName = bestEggNameForCurrentZone()
+    local set = eggName and eggPets(eggName) or {}
+    local base, rain, baseT, rainT = {}, {}, 0, 0
+    if library then
+        pcall(function()
+            for uid, pet in pairs(library.Get().Inventory.Pet) do
+                if not pet.l and not pet.locked and not pet.lk then
+                    local pt = tonumber(pet.pt) or 0
+                    if pt == 0 or pt == 1 then
+                        local id, m = tostring(pet.id), false
+                        for k in pairs(set) do
+                            if id == k or string.find(id, k) or string.find(k, id) then m = true; break end
+                        end
+                        if m then
+                            local c = math.floor((tonumber(pet._am) or 1) / 10)
+                            if c > 0 then
+                                if pt == 0 then table.insert(base, { uid = uid, crafts = c }); baseT = baseT + c
+                                else table.insert(rain, { uid = uid, crafts = c }); rainT = rainT + c end
+                            end
+                        end
+                    end
+                end
+            end
+        end)
+    end
+    if rainT > 0 then
+        local used, rem = {}, q.remaining
+        table.sort(rain, function(a, b) return a.crafts > b.crafts end)
+        for _, p in ipairs(rain) do
+            if rem > 0 then
+                local u = math.min(p.crafts, rem); table.insert(used, { uid = p.uid, amt = u }); rem = rem - u
+            end
+        end
+        if #used > 0 then
+            getgenv().IsDoingSpecificQuest = true
+            gotoAndUseMachine(41, "RainbowMachine")
+            for _, u in ipairs(used) do
+                machineAction("RainbowMachine_Activate", "RainbowMachine", u.uid, u.amt)
+                task.wait(0.2)
+            end
+            getgenv().IsDoingSpecificQuest = false
+        end
+    end
+    if rainT < q.remaining then
+        if baseT > 0 then
+            local used, rem = {}, (q.remaining - rainT) * 10
+            table.sort(base, function(a, b) return a.crafts > b.crafts end)
+            for _, p in ipairs(base) do
+                if rem > 0 then
+                    local u = math.min(p.crafts, rem); table.insert(used, { uid = p.uid, amt = u }); rem = rem - u
+                end
+            end
+            if #used > 0 then
+                getgenv().IsDoingSpecificQuest = true
+                gotoAndUseMachine(31, "GoldMachine")
+                for _, u in ipairs(used) do
+                    machineAction("GoldMachine_Activate", "GoldMachine", u.uid, u.amt)
+                    task.wait(0.2)
+                end
+                getgenv().IsDoingSpecificQuest = false
+            end
+        end
+        if rainT * 10 + baseT < q.remaining * 10 and eggName then
+            if currentZoneByPosition() ~= bestUnlockedZone() then
                 getgenv().IsMachineActionActive = true
                 teleportToBestArea()
                 task.wait(0.5)
                 getgenv().IsMachineActionActive = false
             end
-        end)
+            task.spawn(function()
+                pcall(function() network:FindFirstChild("Eggs_RequestPurchase"):InvokeServer(eggName, hatchQty()) end)
+            end)
+            task.wait(0.1)
+        end
     end
-end)
+end
+
+local function handleFlag(q)
+    if not canUse("flag", 1.25) then return end
+    local flags = { "Fortune Flag", "Strength Flag", "Magnet Flag", "Coins Flag",
+                    "Hasty Flag", "Diamonds Flag", "Rainbow Flag", "Shiny Flag" }
+    for _, f in ipairs(flags) do
+        local uid = findItemUid(f, false)
+        if uid then
+            pcall(function() network:FindFirstChild("FlexibleFlags_Consume"):InvokeServer(f, uid) end)
+            return
+        end
+    end
+    rememberFailedQuest(q.raw)
+end
+
+local function handleFruit(q)
+    if not canUse("fruit", 1.25) then return end
+    if prog ~= -1 and q.remaining == prog then
+        val104 = val104 + 1
+        if val104 > #val103 then val104 = 1 end
+    end
+    local fruit = val103[val104]
+    local uid = findItemUid(fruit, false)
+        or findItemUid(fruit == "Rainbow Fruit" and "Rainbow" or fruit:gsub(" ", ""), false)
+    if uid then
+        pcall(function() network:FindFirstChild("Fruits: Consume"):FireServer(uid, 1) end)
+        prog = q.remaining
+    else rememberFailedQuest(q.raw) end
+end
+
+local function handleComet(q)
+    if not canUse("comet", 1.25) then return end
+    local uid = findItemUid("Comet", false)
+    if uid then
+        for _ = 1, q.remaining do
+            pcall(function() network:FindFirstChild("Comet_Spawn"):InvokeServer(uid) end)
+            task.wait(0.1)
+        end
+    else rememberFailedQuest(q.raw) end
+end
+
+local function handleJar(q)
+    if not canUse("jar", 1.25) then return end
+    local uid
+    for _, n in ipairs({ "Basic Coin Jar", "CoinJar", "Coin Jar", "Jar" }) do
+        uid = findItemUid(n, false); if uid then break end
+    end
+    if uid then pcall(function() network:FindFirstChild("CoinJar_Spawn"):InvokeServer(uid) end)
+    else rememberFailedQuest(q.raw) end
+end
+
+local function handlePinata(q)
+    if not canUse("pinata", 1.25) then return end
+    local uid
+    for _, n in ipairs({ "Mini Pinata", "MiniPinata" }) do
+        uid = findItemUid(n, false); if uid then break end
+    end
+    if uid then pcall(function() network:FindFirstChild("MiniPinata_Consume"):InvokeServer(uid) end)
+    else rememberFailedQuest(q.raw) end
+end
+
+local function handleLucky(q)
+    if not canUse("lucky", 1.25) then return end
+    local uid
+    for _, n in ipairs({ "Mini Lucky Block", "MiniLuckyBlock" }) do
+        uid = findItemUid(n, false); if uid then break end
+    end
+    if uid then pcall(function() network:FindFirstChild("MiniLuckyBlock_Consume"):InvokeServer(uid) end)
+    else rememberFailedQuest(q.raw) end
+end
 
 -- =====================================================================
--- AUTO BUY ZONES
+-- Spawn each handler as its own 1Hz loop -> all active quests run in parallel
+-- =====================================================================
+local handlers = {
+    { name = "Legendary", enabled = function() return val3.Legendary end,
+      match = function(t) return t:find("legendary") ~= nil end, run = handleLegendary },
+    { name = "Hatch", enabled = function() return val3.Hatch end,
+      match = function(t) return t:find("hatch") and not t:find("legendary") end, run = handleHatch },
+    { name = "Potion", enabled = function() return val3.Potion end,
+      match = function(t) return (t:find("drink") or t:find("use")) and t:find("potion") end, run = handlePotion },
+    { name = "Area", enabled = function() return val3.Area end,
+      match = function(t) return (t:find("unlock") or t:find("reach")) and t:find("area") end, run = handleArea },
+    { name = "UpPotion", enabled = function() return val3.UpPotion end,
+      match = function(t) return ((t:find("potion") and t:find("upgrade")) or (t:find("collect") and t:find("potion"))) end,
+      run = handleUpPotion },
+    { name = "UpEnchant", enabled = function() return val3.UpEnchant end,
+      match = function(t) return ((t:find("enchant") and t:find("upgrade")) or (t:find("collect") and t:find("enchant"))) end,
+      run = handleUpEnchant },
+    { name = "Gold", enabled = function() return val3.Gold end,
+      match = function(t) return t:find("golden") ~= nil end, run = handleGold },
+    { name = "Rainbow", enabled = function() return val3.Rainbow end,
+      match = function(t) return t:find("rainbow") ~= nil end, run = handleRainbow },
+    { name = "Flag", enabled = function() return val3.Flag end,
+      match = function(t) return t:find("flag") ~= nil end, run = handleFlag },
+    { name = "Fruit", enabled = function() return val3.Fruit end,
+      match = function(t) return t:find("fruit") ~= nil end, run = handleFruit },
+    { name = "Comet", enabled = function() return val3.Comet end,
+      match = function(t) return t:find("comet") ~= nil end, run = handleComet },
+    { name = "Jar", enabled = function() return val3.Jar end,
+      match = function(t) return t:find("coin") and t:find("jar") end, run = handleJar },
+    { name = "Pinata", enabled = function() return val3.Pinata end,
+      match = function(t) return t:find("pinata") ~= nil end, run = handlePinata },
+    { name = "Lucky", enabled = function() return val3.Lucky end,
+      match = function(t) return t:find("lucky") and t:find("block") end, run = handleLucky },
+}
+
+for _, h in ipairs(handlers) do
+    task.spawn(function()
+        while task.wait(1) do
+            if not getgenv().Nexus_IsRunning then break end
+            if not (val2.Rank and hasZoneAtLeast(41)) then continue end
+            if not h.enabled() then continue end
+            pcall(function()
+                local quests = readQuests()
+                for _, q in ipairs(quests) do
+                    if isQuestBlacklisted(q.raw) then continue end
+                    if h.match(q.txt) then h.run(q); break end
+                end
+            end)
+        end
+    end)
+end
+
+-- =====================================================================
+-- AUTO BUY ZONES / STAY IN ZONE / ULTIMATE / MAILBOX
 -- =====================================================================
 task.spawn(function()
     while task.wait(1) do
@@ -987,9 +1170,7 @@ task.spawn(function()
                     if tonumber(string.match(z.Name, "^(%d+)")) == cur + 1 then
                         local name = string.match(z.Name, "%d+%s*|%s*(.+)") or z.Name
                         if name then
-                            pcall(function()
-                                network:FindFirstChild("Zones_RequestPurchase"):InvokeServer(name)
-                            end)
+                            pcall(function() network:FindFirstChild("Zones_RequestPurchase"):InvokeServer(name) end)
                             task.wait(0.5)
                             if bestUnlockedZone() > cur then teleportToBestArea() end
                         end
@@ -1001,9 +1182,6 @@ task.spawn(function()
     end
 end)
 
--- =====================================================================
--- STAY-IN-ZONE
--- =====================================================================
 task.spawn(function()
     while task.wait(0.5) do
         if not getgenv().Nexus_IsRunning then break end
@@ -1033,42 +1211,24 @@ task.spawn(function()
     end
 end)
 
--- =====================================================================
--- ULTIMATE + BUNDLES
--- =====================================================================
 task.spawn(function()
     while task.wait(2) do
         if not getgenv().Nexus_IsRunning then break end
         if val2.Ultimate and not getgenv().IsMachineActionActive then
             pcall(function()
-                network:FindFirstChild("Ultimates: Activate"):InvokeServer(
-                    getgenv().TargetUltimate or "Ground Pound"
-                )
+                network:FindFirstChild("Ultimates: Activate"):InvokeServer(getgenv().TargetUltimate or "Ground Pound")
             end)
         end
-        if val2.AutoBundleEnchant then
-            pcall(function() network:FindFirstChild("GiftBag_Open"):InvokeServer("Enchant Bundle", 100) end)
-        end
-        if val2.AutoBundlePotion then
-            pcall(function() network:FindFirstChild("GiftBag_Open"):InvokeServer("Potion Bundle", 100) end)
-        end
-        if val2.AutoBundleFruit then
-            pcall(function() network:FindFirstChild("GiftBag_Open"):InvokeServer("Fruit Bundle", 100) end)
-        end
-        if val2.AutoBundleFlag then
-            pcall(function() network:FindFirstChild("GiftBag_Open"):InvokeServer("Flag Bundle", 100) end)
-        end
+        if val2.AutoBundleEnchant then pcall(function() network:FindFirstChild("GiftBag_Open"):InvokeServer("Enchant Bundle", 100) end) end
+        if val2.AutoBundlePotion  then pcall(function() network:FindFirstChild("GiftBag_Open"):InvokeServer("Potion Bundle", 100) end) end
+        if val2.AutoBundleFruit   then pcall(function() network:FindFirstChild("GiftBag_Open"):InvokeServer("Fruit Bundle", 100) end) end
+        if val2.AutoBundleFlag    then pcall(function() network:FindFirstChild("GiftBag_Open"):InvokeServer("Flag Bundle", 100) end) end
     end
 end)
 
--- =====================================================================
--- MAILBOX
--- =====================================================================
 task.spawn(function()
     local function claim()
-        pcall(function()
-            network:FindFirstChild("Machines: Mark Approached"):FireServer("MailboxMachine")
-        end)
+        pcall(function() network:FindFirstChild("Machines: Mark Approached"):FireServer("MailboxMachine") end)
         task.wait(0.2)
         local c = network:FindFirstChild("Mailbox: Claim All")
         if c then
@@ -1086,136 +1246,86 @@ task.spawn(function()
 end)
 
 -- =====================================================================
--- GUI  (fully toggleable — no code edits needed)
+-- GUI
 -- =====================================================================
 local C = {
-    bg     = Color3.fromRGB(22, 22, 28),
-    header = Color3.fromRGB(18, 18, 22),
-    panel  = Color3.fromRGB(30, 30, 38),
-    accent = Color3.fromRGB(0, 150, 255),
-    ok     = Color3.fromRGB(0, 160, 90),
-    bad    = Color3.fromRGB(200, 50, 60),
-    off    = Color3.fromRGB(50, 50, 62),
-    text   = Color3.fromRGB(235, 235, 240),
-    sub    = Color3.fromRGB(150, 150, 160),
-    line   = Color3.fromRGB(45, 45, 55),
+    bg = Color3.fromRGB(22, 22, 28), header = Color3.fromRGB(18, 18, 22),
+    panel = Color3.fromRGB(30, 30, 38), accent = Color3.fromRGB(0, 150, 255),
+    ok = Color3.fromRGB(0, 160, 90), bad = Color3.fromRGB(200, 50, 60),
+    off = Color3.fromRGB(50, 50, 62), text = Color3.fromRGB(235, 235, 240),
+    sub = Color3.fromRGB(150, 150, 160), line = Color3.fromRGB(45, 45, 55),
 }
-local FONT     = Enum.Font.GothamBold
-local FONT_M   = Enum.Font.GothamSemibold
+local FONT, FONT_M = Enum.Font.GothamBold, Enum.Font.GothamSemibold
 
 local uiParent = localPlayer:WaitForChild("PlayerGui")
 pcall(function()
-    if type(gethui) == "function" then
-        local h = gethui(); if h then uiParent = h end
-    end
+    if type(gethui) == "function" then local h = gethui(); if h then uiParent = h end end
 end)
-
 local old = uiParent:FindFirstChild("Nexus_AutoRank")
 if old then old:Destroy() end
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "Nexus_AutoRank"
-gui.ResetOnSpawn = false
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.Parent = uiParent
+gui.Name = "Nexus_AutoRank"; gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; gui.Parent = uiParent
 
-local function corner(p, r)
-    local c = Instance.new("UICorner", p); c.CornerRadius = UDim.new(0, r or 6); return c
-end
+local function corner(p, r) local c = Instance.new("UICorner", p); c.CornerRadius = UDim.new(0, r or 6); return c end
 local function stroke(p, col, t)
     local s = Instance.new("UIStroke", p); s.Color = col or C.accent; s.Thickness = t or 1
     s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border; return s
 end
 
 local main = Instance.new("Frame", gui)
-main.Size = UDim2.new(0, 440, 0, 540)
-main.Position = UDim2.new(0.5, -220, 0.5, -270)
-main.BackgroundColor3 = C.bg
-main.BorderSizePixel = 0
-main.Active = true
+main.Size = UDim2.new(0, 440, 0, 640)
+main.Position = UDim2.new(0.5, -220, 0.5, -320)
+main.BackgroundColor3 = C.bg; main.BorderSizePixel = 0; main.Active = true
 corner(main, 10); stroke(main, C.accent, 2)
 
--- header
 local hdr = Instance.new("Frame", main)
-hdr.Size = UDim2.new(1, 0, 0, 42)
-hdr.BackgroundColor3 = C.header
-hdr.BorderSizePixel = 0
+hdr.Size = UDim2.new(1, 0, 0, 42); hdr.BackgroundColor3 = C.header; hdr.BorderSizePixel = 0
 corner(hdr, 10)
-local hdrFix = Instance.new("Frame", hdr)
-hdrFix.Size = UDim2.new(1, 0, 0, 10)
-hdrFix.Position = UDim2.new(0, 0, 1, -10)
-hdrFix.BackgroundColor3 = C.header
-hdrFix.BorderSizePixel = 0
+local hf = Instance.new("Frame", hdr)
+hf.Size = UDim2.new(1, 0, 0, 10); hf.Position = UDim2.new(0, 0, 1, -10)
+hf.BackgroundColor3 = C.header; hf.BorderSizePixel = 0
 
 local title = Instance.new("TextLabel", hdr)
-title.Size = UDim2.new(1, -90, 1, 0)
-title.Position = UDim2.new(0, 15, 0, 0)
-title.BackgroundTransparency = 1
-title.Text = "NEXUS • AUTO RANK"
-title.TextColor3 = C.accent
-title.Font = FONT
-title.TextSize = 14
+title.Size = UDim2.new(1, -90, 1, 0); title.Position = UDim2.new(0, 15, 0, 0)
+title.BackgroundTransparency = 1; title.Text = "NEXUS • AUTO RANK"
+title.TextColor3 = C.accent; title.Font = FONT; title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 
 local minBtn = Instance.new("TextButton", hdr)
-minBtn.Size = UDim2.new(0, 36, 0, 36)
-minBtn.Position = UDim2.new(1, -80, 0, 3)
-minBtn.BackgroundTransparency = 1
-minBtn.Text = "—"
-minBtn.TextColor3 = C.sub
-minBtn.Font = FONT
-minBtn.TextSize = 22
-minBtn.AutoButtonColor = false
+minBtn.Size = UDim2.new(0, 36, 0, 36); minBtn.Position = UDim2.new(1, -80, 0, 3)
+minBtn.BackgroundTransparency = 1; minBtn.Text = "—"; minBtn.TextColor3 = C.sub
+minBtn.Font = FONT; minBtn.TextSize = 22; minBtn.AutoButtonColor = false
 
 local closeBtn = Instance.new("TextButton", hdr)
-closeBtn.Size = UDim2.new(0, 36, 0, 36)
-closeBtn.Position = UDim2.new(1, -44, 0, 3)
-closeBtn.BackgroundTransparency = 1
-closeBtn.Text = "✕"
-closeBtn.TextColor3 = C.bad
-closeBtn.Font = FONT
-closeBtn.TextSize = 16
-closeBtn.AutoButtonColor = false
+closeBtn.Size = UDim2.new(0, 36, 0, 36); closeBtn.Position = UDim2.new(1, -44, 0, 3)
+closeBtn.BackgroundTransparency = 1; closeBtn.Text = "✕"; closeBtn.TextColor3 = C.bad
+closeBtn.Font = FONT; closeBtn.TextSize = 16; closeBtn.AutoButtonColor = false
 
--- divider
 local dv = Instance.new("Frame", main)
-dv.Size = UDim2.new(1, 0, 0, 1)
-dv.Position = UDim2.new(0, 0, 0, 42)
-dv.BackgroundColor3 = C.line
-dv.BorderSizePixel = 0
+dv.Size = UDim2.new(1, 0, 0, 1); dv.Position = UDim2.new(0, 0, 0, 42)
+dv.BackgroundColor3 = C.line; dv.BorderSizePixel = 0
 
--- status bar
 local statusBar = Instance.new("Frame", main)
-statusBar.Size = UDim2.new(1, -20, 0, 26)
-statusBar.Position = UDim2.new(0, 10, 0, 50)
-statusBar.BackgroundColor3 = C.panel
-statusBar.BorderSizePixel = 0
-corner(statusBar, 6)
+statusBar.Size = UDim2.new(1, -20, 0, 26); statusBar.Position = UDim2.new(0, 10, 0, 50)
+statusBar.BackgroundColor3 = C.panel; statusBar.BorderSizePixel = 0; corner(statusBar, 6)
 
 local status = Instance.new("TextLabel", statusBar)
-status.Size = UDim2.new(1, -12, 1, 0)
-status.Position = UDim2.new(0, 6, 0, 0)
-status.BackgroundTransparency = 1
-status.Text = "Status: Starting..."
-status.TextColor3 = C.sub
-status.Font = FONT_M
-status.TextSize = 10
+status.Size = UDim2.new(1, -12, 1, 0); status.Position = UDim2.new(0, 6, 0, 0)
+status.BackgroundTransparency = 1; status.Text = "Status: Starting..."
+status.TextColor3 = C.sub; status.Font = FONT_M; status.TextSize = 10
 status.TextXAlignment = Enum.TextXAlignment.Left
 status.TextTruncate = Enum.TextTruncate.AtEnd
 
--- scroll
 local scroll = Instance.new("ScrollingFrame", main)
-scroll.Size = UDim2.new(1, -20, 1, -142)
-scroll.Position = UDim2.new(0, 10, 0, 84)
-scroll.BackgroundTransparency = 1
-scroll.BorderSizePixel = 0
-scroll.ScrollBarThickness = 4
-scroll.ScrollBarImageColor3 = C.accent
+scroll.Size = UDim2.new(1, -20, 1, -142); scroll.Position = UDim2.new(0, 10, 0, 84)
+scroll.BackgroundTransparency = 1; scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 4; scroll.ScrollBarImageColor3 = C.accent
 scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
 
 local lay = Instance.new("UIListLayout", scroll)
-lay.SortOrder = Enum.SortOrder.LayoutOrder
-lay.Padding = UDim.new(0, 4)
+lay.SortOrder = Enum.SortOrder.LayoutOrder; lay.Padding = UDim.new(0, 4)
 lay.HorizontalAlignment = Enum.HorizontalAlignment.Center
 lay:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
     scroll.CanvasSize = UDim2.new(0, 0, 0, lay.AbsoluteContentSize.Y + 10)
@@ -1226,38 +1336,24 @@ local function nextOrder() order = order + 1; return order end
 
 local function section(label)
     local h = Instance.new("Frame", scroll)
-    h.Size = UDim2.new(1, -10, 0, 22)
-    h.BackgroundColor3 = C.header
-    h.BorderSizePixel = 0
-    h.LayoutOrder = nextOrder()
-    corner(h, 4)
+    h.Size = UDim2.new(1, -10, 0, 22); h.BackgroundColor3 = C.header
+    h.BorderSizePixel = 0; h.LayoutOrder = nextOrder(); corner(h, 4)
     local l = Instance.new("TextLabel", h)
-    l.Size = UDim2.new(1, -12, 1, 0)
-    l.Position = UDim2.new(0, 8, 0, 0)
-    l.BackgroundTransparency = 1
-    l.Text = label
-    l.TextColor3 = C.accent
-    l.Font = FONT
-    l.TextSize = 10
-    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Size = UDim2.new(1, -12, 1, 0); l.Position = UDim2.new(0, 8, 0, 0)
+    l.BackgroundTransparency = 1; l.Text = label; l.TextColor3 = C.accent
+    l.Font = FONT; l.TextSize = 10; l.TextXAlignment = Enum.TextXAlignment.Left
 end
 
 local function toggle(label, tbl, key)
     local b = Instance.new("TextButton", scroll)
     b.Size = UDim2.new(1, -10, 0, 28)
     b.BackgroundColor3 = tbl[key] and C.ok or C.off
-    b.BorderSizePixel = 0
-    b.AutoButtonColor = false
+    b.BorderSizePixel = 0; b.AutoButtonColor = false
     b.Text = (tbl[key] and "[ON]  " or "[OFF] ") .. label
-    b.TextColor3 = C.text
-    b.Font = FONT_M
-    b.TextSize = 11
-    b.TextXAlignment = Enum.TextXAlignment.Left
-    b.LayoutOrder = nextOrder()
+    b.TextColor3 = C.text; b.Font = FONT_M; b.TextSize = 11
+    b.TextXAlignment = Enum.TextXAlignment.Left; b.LayoutOrder = nextOrder()
     corner(b, 5)
-    local pad = Instance.new("UIPadding", b)
-    pad.PaddingLeft = UDim.new(0, 10)
-
+    local pad = Instance.new("UIPadding", b); pad.PaddingLeft = UDim.new(0, 10)
     b.MouseButton1Click:Connect(function()
         tbl[key] = not tbl[key]
         b.BackgroundColor3 = tbl[key] and C.ok or C.off
@@ -1266,80 +1362,66 @@ local function toggle(label, tbl, key)
     return b
 end
 
-local function numInput(label, getter, setter)
+local function slider(label, get, set, min, max, step)
     local f = Instance.new("Frame", scroll)
-    f.Size = UDim2.new(1, -10, 0, 30)
-    f.BackgroundColor3 = C.panel
-    f.BorderSizePixel = 0
-    f.LayoutOrder = nextOrder()
-    corner(f, 5)
-
+    f.Size = UDim2.new(1, -10, 0, 30); f.BackgroundColor3 = C.panel
+    f.BorderSizePixel = 0; f.LayoutOrder = nextOrder(); corner(f, 5)
     local l = Instance.new("TextLabel", f)
-    l.Size = UDim2.new(0.55, 0, 1, 0)
-    l.Position = UDim2.new(0, 10, 0, 0)
-    l.BackgroundTransparency = 1
-    l.Text = label
-    l.TextColor3 = C.text
-    l.Font = FONT_M
-    l.TextSize = 11
+    l.Size = UDim2.new(0.55, 0, 1, 0); l.Position = UDim2.new(0, 10, 0, 0)
+    l.BackgroundTransparency = 1; l.Text = label .. ": " .. tostring(get())
+    l.TextColor3 = C.text; l.Font = FONT_M; l.TextSize = 11
     l.TextXAlignment = Enum.TextXAlignment.Left
-
     local box = Instance.new("TextBox", f)
-    box.Size = UDim2.new(0.35, 0, 0.72, 0)
-    box.Position = UDim2.new(0.6, 0, 0.14, 0)
-    box.BackgroundColor3 = C.bg
-    box.BorderSizePixel = 0
-    box.Text = tostring(getter())
-    box.TextColor3 = C.accent
-    box.Font = FONT
-    box.TextSize = 11
-    box.ClearTextOnFocus = false
-    corner(box, 4); stroke(box, C.line, 1)
-
+    box.Size = UDim2.new(0.30, 0, 0.7, 0); box.Position = UDim2.new(0.65, 0, 0.15, 0)
+    box.BackgroundColor3 = C.bg; box.BorderSizePixel = 0
+    box.Text = tostring(get()); box.TextColor3 = C.accent; box.Font = FONT; box.TextSize = 11
+    box.ClearTextOnFocus = false; corner(box, 4); stroke(box, C.line, 1)
     box.FocusLost:Connect(function()
         local n = tonumber(box.Text)
-        if n then setter(n) end
-        box.Text = tostring(getter())
+        if n then
+            n = math.clamp(n, min, max)
+            if step then n = math.floor(n / step + 0.5) * step end
+            set(n)
+        end
+        box.Text = tostring(get())
+        l.Text = label .. ": " .. tostring(get())
     end)
 end
 
-local function txtInput(label, getter, setter)
+local function numInput(label, get, set)
     local f = Instance.new("Frame", scroll)
-    f.Size = UDim2.new(1, -10, 0, 30)
-    f.BackgroundColor3 = C.panel
-    f.BorderSizePixel = 0
-    f.LayoutOrder = nextOrder()
-    corner(f, 5)
-
+    f.Size = UDim2.new(1, -10, 0, 30); f.BackgroundColor3 = C.panel
+    f.BorderSizePixel = 0; f.LayoutOrder = nextOrder(); corner(f, 5)
     local l = Instance.new("TextLabel", f)
-    l.Size = UDim2.new(0.4, 0, 1, 0)
-    l.Position = UDim2.new(0, 10, 0, 0)
-    l.BackgroundTransparency = 1
-    l.Text = label
-    l.TextColor3 = C.text
-    l.Font = FONT_M
-    l.TextSize = 11
-    l.TextXAlignment = Enum.TextXAlignment.Left
-
+    l.Size = UDim2.new(0.55, 0, 1, 0); l.Position = UDim2.new(0, 10, 0, 0)
+    l.BackgroundTransparency = 1; l.Text = label; l.TextColor3 = C.text
+    l.Font = FONT_M; l.TextSize = 11; l.TextXAlignment = Enum.TextXAlignment.Left
     local box = Instance.new("TextBox", f)
-    box.Size = UDim2.new(0.55, -10, 0.72, 0)
-    box.Position = UDim2.new(0.45, 0, 0.14, 0)
-    box.BackgroundColor3 = C.bg
-    box.BorderSizePixel = 0
-    box.Text = tostring(getter())
-    box.TextColor3 = C.accent
-    box.Font = FONT
-    box.TextSize = 11
-    box.ClearTextOnFocus = false
-    corner(box, 4); stroke(box, C.line, 1)
-
+    box.Size = UDim2.new(0.35, 0, 0.72, 0); box.Position = UDim2.new(0.6, 0, 0.14, 0)
+    box.BackgroundColor3 = C.bg; box.BorderSizePixel = 0; box.Text = tostring(get())
+    box.TextColor3 = C.accent; box.Font = FONT; box.TextSize = 11
+    box.ClearTextOnFocus = false; corner(box, 4); stroke(box, C.line, 1)
     box.FocusLost:Connect(function()
-        setter(box.Text)
-        box.Text = tostring(getter())
+        local n = tonumber(box.Text); if n then set(n) end; box.Text = tostring(get())
     end)
 end
 
--- populate
+local function txtInput(label, get, set)
+    local f = Instance.new("Frame", scroll)
+    f.Size = UDim2.new(1, -10, 0, 30); f.BackgroundColor3 = C.panel
+    f.BorderSizePixel = 0; f.LayoutOrder = nextOrder(); corner(f, 5)
+    local l = Instance.new("TextLabel", f)
+    l.Size = UDim2.new(0.4, 0, 1, 0); l.Position = UDim2.new(0, 10, 0, 0)
+    l.BackgroundTransparency = 1; l.Text = label; l.TextColor3 = C.text
+    l.Font = FONT_M; l.TextSize = 11; l.TextXAlignment = Enum.TextXAlignment.Left
+    local box = Instance.new("TextBox", f)
+    box.Size = UDim2.new(0.55, -10, 0.72, 0); box.Position = UDim2.new(0.45, 0, 0.14, 0)
+    box.BackgroundColor3 = C.bg; box.BorderSizePixel = 0; box.Text = tostring(get())
+    box.TextColor3 = C.accent; box.Font = FONT; box.TextSize = 11
+    box.ClearTextOnFocus = false; corner(box, 4); stroke(box, C.line, 1)
+    box.FocusLost:Connect(function() set(box.Text); box.Text = tostring(get()) end)
+end
+
 section("MAIN FEATURES")
 toggle("Auto Rank Quests",  val2, "Rank")
 toggle("Auto Farm Area",    val2, "AutoFarmArea")
@@ -1348,6 +1430,22 @@ toggle("Anti AFK",          val2, "AntiAFK")
 toggle("Auto Claim Mail",   val2, "AutoClaimMail")
 toggle("Auto Use Ultimate", val2, "Ultimate")
 
+section("COMBAT")
+toggle("Auto Tap Nearby Breakables", val2, "AutoTap")
+slider("Tap Rate", function() return getgenv().TapRate end,
+    function(v) getgenv().TapRate = v end, 1, 16, 1)
+slider("Tap Radius", function() return getgenv().TapRadius end,
+    function(v) getgenv().TapRadius = v end, 25, 500, 5)
+toggle("Auto Collect Orbs", val2, "AutoCollectOrbs")
+
+section("EGG HATCHING")
+slider("Hatch Cap (per tick)", function() return getgenv().HatchCap end,
+    function(v) getgenv().HatchCap = math.floor(v) end, 1, 99, 1)
+local hideEggToggle = toggle("Hide Egg Hatching UI", val2, "HideEggUI")
+hideEggToggle.MouseButton1Click:Connect(function()
+    pcall(function() setEggUIHidden(val2.HideEggUI) end)
+end)
+
 section("AUTO BUNDLES")
 toggle("Enchant Bundles", val2, "AutoBundleEnchant")
 toggle("Potion Bundles",  val2, "AutoBundlePotion")
@@ -1355,145 +1453,92 @@ toggle("Fruit Bundles",   val2, "AutoBundleFruit")
 toggle("Flag Bundles",    val2, "AutoBundleFlag")
 
 section("QUEST TYPES")
-toggle("Legendary Pets",  val3, "Legendary")
-toggle("Rainbow Pets",    val3, "Rainbow")
-toggle("Gold Pets",       val3, "Gold")
-toggle("Hatch Eggs",      val3, "Hatch")
-toggle("Comets",          val3, "Comet")
-toggle("Coin Jars",       val3, "Jar")
-toggle("Pinatas",         val3, "Pinata")
-toggle("Lucky Blocks",    val3, "Lucky")
-toggle("Flags",           val3, "Flag")
-toggle("Fruits",          val3, "Fruit")
-toggle("Drink Potions",   val3, "Potion")
-toggle("Unlock Area",     val3, "Area")
-toggle("Upgrade Potions", val3, "UpPotion")
-toggle("Upgrade Enchants",val3, "UpEnchant")
+toggle("Legendary Pets",   val3, "Legendary")
+toggle("Rainbow Pets",     val3, "Rainbow")
+toggle("Gold Pets",        val3, "Gold")
+toggle("Hatch Eggs",       val3, "Hatch")
+toggle("Comets",           val3, "Comet")
+toggle("Coin Jars",        val3, "Jar")
+toggle("Pinatas",          val3, "Pinata")
+toggle("Lucky Blocks",     val3, "Lucky")
+toggle("Flags",            val3, "Flag")
+toggle("Fruits",           val3, "Fruit")
+toggle("Drink Potions",    val3, "Potion")
+toggle("Unlock Area",      val3, "Area")
+toggle("Upgrade Potions",  val3, "UpPotion")
+toggle("Upgrade Enchants", val3, "UpEnchant")
 
 section("SETTINGS")
-numInput("Legendary Egg Offset",
-    function() return getgenv().LegendaryEggOffset or 1 end,
-    function(v)
-        getgenv().LegendaryEggOffset = math.clamp(math.floor(v), 1, 10)
-    end
-)
-txtInput("Ultimate Name",
-    function() return getgenv().TargetUltimate or "Ground Pound" end,
-    function(v) if v and v ~= "" then getgenv().TargetUltimate = v end end
-)
+numInput("Legendary Egg Offset", function() return getgenv().LegendaryEggOffset or 1 end,
+    function(v) getgenv().LegendaryEggOffset = math.clamp(math.floor(v), 1, 10) end)
+txtInput("Ultimate Name", function() return getgenv().TargetUltimate or "Ground Pound" end,
+    function(v) if v and v ~= "" then getgenv().TargetUltimate = v end end)
 
 -- drag
 local dragToggle, dragInput, dragStart, dragPos
 hdr.InputBegan:Connect(function(i)
-    if i.UserInputType == Enum.UserInputType.MouseButton1
-        or i.UserInputType == Enum.UserInputType.Touch then
-        dragToggle = true
-        dragStart  = i.Position
-        dragPos    = main.Position
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragToggle = true; dragStart = i.Position; dragPos = main.Position
         i.Changed:Connect(function()
             if i.UserInputState == Enum.UserInputState.End then dragToggle = false end
         end)
     end
 end)
 hdr.InputChanged:Connect(function(i)
-    if i.UserInputType == Enum.UserInputType.MouseMovement
-        or i.UserInputType == Enum.UserInputType.Touch then
+    if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
         dragInput = i
     end
 end)
 userInputService.InputChanged:Connect(function(i)
     if dragToggle and i == dragInput then
         local d = i.Position - dragStart
-        main.Position = UDim2.new(
-            dragPos.X.Scale, dragPos.X.Offset + d.X,
-            dragPos.Y.Scale, dragPos.Y.Offset + d.Y
-        )
+        main.Position = UDim2.new(dragPos.X.Scale, dragPos.X.Offset + d.X, dragPos.Y.Scale, dragPos.Y.Offset + d.Y)
     end
 end)
 
 -- minimize / restore
 local miniBtn = Instance.new("TextButton", gui)
-miniBtn.Size = UDim2.new(0, 46, 0, 46)
-miniBtn.Position = UDim2.new(0.5, -23, 0, 40)
-miniBtn.BackgroundColor3 = C.header
-miniBtn.BorderSizePixel = 0
-miniBtn.Text = "N"
-miniBtn.TextColor3 = C.accent
-miniBtn.Font = FONT
-miniBtn.TextSize = 18
-miniBtn.Visible = false
-corner(miniBtn, 999); stroke(miniBtn, C.accent, 2)
+miniBtn.Size = UDim2.new(0, 46, 0, 46); miniBtn.Position = UDim2.new(0.5, -23, 0, 40)
+miniBtn.BackgroundColor3 = C.header; miniBtn.BorderSizePixel = 0; miniBtn.Text = "N"
+miniBtn.TextColor3 = C.accent; miniBtn.Font = FONT; miniBtn.TextSize = 18
+miniBtn.Visible = false; corner(miniBtn, 999); stroke(miniBtn, C.accent, 2)
 
-minBtn.MouseButton1Click:Connect(function()
-    main.Visible = false
-    miniBtn.Visible = true
-end)
-miniBtn.MouseButton1Click:Connect(function()
-    main.Visible = true
-    miniBtn.Visible = false
-end)
+minBtn.MouseButton1Click:Connect(function() main.Visible = false; miniBtn.Visible = true end)
+miniBtn.MouseButton1Click:Connect(function() main.Visible = true; miniBtn.Visible = false end)
 
 -- confirmation modal
 local modal = Instance.new("Frame", gui)
-modal.Size = UDim2.new(0, 300, 0, 150)
-modal.Position = UDim2.new(0.5, -150, 0.5, -75)
-modal.BackgroundColor3 = C.bg
-modal.BorderSizePixel = 0
-modal.Visible = false
-modal.ZIndex = 10
+modal.Size = UDim2.new(0, 300, 0, 150); modal.Position = UDim2.new(0.5, -150, 0.5, -75)
+modal.BackgroundColor3 = C.bg; modal.BorderSizePixel = 0; modal.Visible = false; modal.ZIndex = 10
 corner(modal, 10); stroke(modal, C.bad, 2)
-
 local ml = Instance.new("TextLabel", modal)
-ml.Size = UDim2.new(1, -20, 0.5, 0)
-ml.Position = UDim2.new(0, 10, 0.1, 0)
-ml.BackgroundTransparency = 1
-ml.Text = "Stop the script completely?"
-ml.TextColor3 = C.text
-ml.Font = FONT
-ml.TextSize = 13
-ml.TextWrapped = true
-ml.ZIndex = 11
+ml.Size = UDim2.new(1, -20, 0.5, 0); ml.Position = UDim2.new(0, 10, 0.1, 0)
+ml.BackgroundTransparency = 1; ml.Text = "Stop the script completely?"
+ml.TextColor3 = C.text; ml.Font = FONT; ml.TextSize = 13; ml.TextWrapped = true; ml.ZIndex = 11
 
 local yb = Instance.new("TextButton", modal)
-yb.Size = UDim2.new(0.4, 0, 0, 34)
-yb.Position = UDim2.new(0.06, 0, 0.65, 0)
-yb.BackgroundColor3 = C.bad
-yb.BorderSizePixel = 0
-yb.Text = "YES"
-yb.TextColor3 = C.text
-yb.Font = FONT
-yb.ZIndex = 11
-corner(yb, 6)
+yb.Size = UDim2.new(0.4, 0, 0, 34); yb.Position = UDim2.new(0.06, 0, 0.65, 0)
+yb.BackgroundColor3 = C.bad; yb.BorderSizePixel = 0; yb.Text = "YES"
+yb.TextColor3 = C.text; yb.Font = FONT; yb.ZIndex = 11; corner(yb, 6)
 
 local nb = Instance.new("TextButton", modal)
-nb.Size = UDim2.new(0.4, 0, 0, 34)
-nb.Position = UDim2.new(0.54, 0, 0.65, 0)
-nb.BackgroundColor3 = C.off
-nb.BorderSizePixel = 0
-nb.Text = "NO"
-nb.TextColor3 = C.text
-nb.Font = FONT
-nb.ZIndex = 11
-corner(nb, 6)
+nb.Size = UDim2.new(0.4, 0, 0, 34); nb.Position = UDim2.new(0.54, 0, 0.65, 0)
+nb.BackgroundColor3 = C.off; nb.BorderSizePixel = 0; nb.Text = "NO"
+nb.TextColor3 = C.text; nb.Font = FONT; nb.ZIndex = 11; corner(nb, 6)
 
 closeBtn.MouseButton1Click:Connect(function() modal.Visible = true end)
 nb.MouseButton1Click:Connect(function() modal.Visible = false end)
 yb.MouseButton1Click:Connect(function()
     getgenv().Nexus_IsRunning = false
+    pcall(function() setEggUIHidden(false) end)
     pcall(function() gui:Destroy() end)
 end)
 
--- keybind
 userInputService.InputBegan:Connect(function(i, gp)
     if gp then return end
     if i.KeyCode == Enum.KeyCode.RightShift then
-        if main.Visible then
-            main.Visible = false
-            miniBtn.Visible = true
-        else
-            main.Visible = true
-            miniBtn.Visible = false
-        end
+        if main.Visible then main.Visible = false; miniBtn.Visible = true
+        else main.Visible = true; miniBtn.Visible = false end
     end
 end)
 
@@ -1504,17 +1549,16 @@ task.spawn(function()
         pcall(function()
             local z = 0
             local ok, v = pcall(function() return bestUnlockedZone() end)
-            if ok and v then z = v end
-            if z < 0 then z = 0 end
-
+            if ok and v and v > 0 then z = v end
             local parts = {}
             if val2.Rank then
                 if z >= 41 then parts[#parts+1] = "Rank: ACTIVE"
                 else parts[#parts+1] = "Rank: WAIT (zone " .. z .. "/41)" end
             else parts[#parts+1] = "Rank: OFF" end
+            if val2.AutoTap then parts[#parts+1] = "Tap: ON" end
+            if val2.AutoCollectOrbs then parts[#parts+1] = "Orbs: ON" end
+            if val2.HideEggUI then parts[#parts+1] = "EggUI: OFF" end
             if val2.AutoFarmArea then parts[#parts+1] = "Farm: ON" end
-            if val2.BuyZone then parts[#parts+1] = "Buy: ON" end
-            if val2.AntiAFK then parts[#parts+1] = "AFK: ON" end
             status.Text = table.concat(parts, "  |  ")
         end)
     end
