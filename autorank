@@ -1350,3 +1350,5 @@ log("Zone: "..bestZoneName())
 local egg = bestEgg()
 log("Egg: "..tostring(egg and egg.name or "?").." | max hatch: "..maxHatch())
 log("READY. RightShift toggles GUI.")
+
+.
